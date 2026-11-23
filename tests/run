@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+RUN_PERF=1
+
+while (($#)); do
+  case "$1" in
+    --no-perf) RUN_PERF=0 ;;
+    -h|--help)
+      printf 'Usage: tests/run [--no-perf]\n'
+      exit 0
+      ;;
+    *)
+      printf 'tests/run: unknown option: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+"$ROOT/scripts/check-syntax.sh"
+
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck \
+    "$ROOT/scripts/install" \
+    "$ROOT/scripts/uninstall" \
+    "$ROOT/scripts/import-history" \
+    "$ROOT/scripts/benchmark.sh" \
+    "$ROOT/scripts/check-syntax.sh" \
+    "$ROOT/tests/run"
+fi
+
+if command -v ruff >/dev/null 2>&1; then
+  ruff check "$ROOT/tests/pty_smoke.py"
+  ruff format --check "$ROOT/tests/pty_smoke.py"
+fi
+
+if command -v pyright >/dev/null 2>&1; then
+  pyright "$ROOT/tests/pty_smoke.py"
+fi
+
+"$ROOT/tests/smoke.zsh"
+"$ROOT/tests/installer.zsh"
+"$ROOT/tests/history.zsh"
+"$ROOT/tests/extract.zsh"
+python3 -m py_compile "$ROOT/tests/pty_smoke.py"
+rm -rf "$ROOT/tests/__pycache__"
+python3 "$ROOT/tests/pty_smoke.py"
+
+if (( RUN_PERF )); then
+  "$ROOT/scripts/benchmark.sh" 30
+fi
+
+printf 'tests: all checks passed\n'

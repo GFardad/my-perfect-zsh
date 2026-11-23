@@ -1,0 +1,15 @@
+# Pinned dependency checkouts are installed, never committed.
+vendor/
+
+# Machine-owned configuration.
+config/local.d/
+
+# Private audit captures and traces.
+audit/
+
+# Zsh and test artifacts.
+*.zwc
+*.pyc
+__pycache__/
+.ruff_cache/
+.DS_Store

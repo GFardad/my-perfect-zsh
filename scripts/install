@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+LOCK="$ROOT/deps.lock"
+MODE=install
+INSTALL_DEPS=1
+LINK_ZSHRC=1
+CONFIGURE_ATUIN=1
+ALLOW_DRIFT=0
+STAGING_ROOT=''
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/install [options]
+
+Options:
+  --check                 Verify dependencies and tools without changing files.
+  --no-deps               Do not install or update vendored checkouts.
+  --no-link               Do not replace ~/.zshrc or ~/.zshenv.
+  --no-configure-atuin    Do not update Atuin's privacy settings.
+  --allow-version-drift   Accept external tools newer or older than deps.lock.
+  -h, --help              Show this help.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --check) MODE=check; INSTALL_DEPS=0; LINK_ZSHRC=0; CONFIGURE_ATUIN=0 ;;
+    --no-deps) INSTALL_DEPS=0 ;;
+    --no-link) LINK_ZSHRC=0 ;;
+    --no-configure-atuin) CONFIGURE_ATUIN=0 ;;
+    --allow-version-drift) ALLOW_DRIFT=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'install: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+log() { printf 'install: %s\n' "$*"; }
+warn() { printf 'install: warning: %s\n' "$*" >&2; }
+die() { printf 'install: error: %s\n' "$*" >&2; exit 1; }
+
+cleanup_staging() {
+  [[ -z "$STAGING_ROOT" ]] || rm -rf -- "$STAGING_ROOT"
+  STAGING_ROOT=''
+}
+trap cleanup_staging EXIT
+
+atuin_filter_array_elements() {
+  printf '%s\n' "$1" | awk '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    {
+      for (position = 1; position <= length($0); position++) {
+        character = substr($0, position, 1)
+        if (!started) {
+          if (character == "[") {
+            started = 1
+            depth = 1
+            element = ""
+          }
+          continue
+        }
+        if (literal) {
+          element = element character
+          if (character == "\047") {
+            literal = 0
+          }
+          continue
+        }
+        if (quoted) {
+          element = element character
+          if (escaped) {
+            escaped = 0
+          } else if (character == "\\") {
+            escaped = 1
+          } else if (character == "\"") {
+            quoted = 0
+          }
+          continue
+        }
+        if (character == "\047") {
+          literal = 1
+          element = element character
+          continue
+        }
+        if (character == "\"") {
+          quoted = 1
+          element = element character
+          continue
+        }
+        if (character == "[") {
+          depth++
+          element = element character
+          continue
+        }
+        if (character == "]") {
+          depth--
+          if (depth == 0) {
+            if (trim(element) != "") {
+              print trim(element)
+            }
+            exit
+          }
+          element = element character
+          continue
+        }
+        if (character == "," && depth == 1) {
+          if (trim(element) != "") {
+            print trim(element)
+          }
+          element = ""
+          continue
+        }
+        element = element character
+      }
+    }
+  '
+}
+
+atuin_has_exact_whitespace_filter() {
+  local element
+  while IFS= read -r element; do
+    case "$element" in
+      "'^\\s+'" | '"^\\s+"') return 0 ;;
+    esac
+  done < <(atuin_filter_array_elements "$1")
+  return 1
+}
+
+atuin_filter_rejects_leading_whitespace() {
+  local candidate_dir="$1"
+  local test_home="$candidate_dir/atuin-policy-home"
+  local tab_id
+  local visible_id
+
+  mkdir -p "$test_home" "$candidate_dir/atuin-policy-data"
+  tab_id=$(HOME="$test_home" \
+    ATUIN_HOME="$test_home" \
+    XDG_DATA_HOME="$candidate_dir/atuin-policy-data" \
+    ATUIN_CONFIG_DIR="$candidate_dir" \
+    atuin history start --hook -- $'\techo MPZ_ACTUIN_POLICY_SECRET' \
+    2>/dev/null || true)
+  [[ -z "$tab_id" ]] || return 1
+
+  visible_id=$(HOME="$test_home" \
+    ATUIN_HOME="$test_home" \
+    XDG_DATA_HOME="$candidate_dir/atuin-policy-data" \
+    ATUIN_CONFIG_DIR="$candidate_dir" \
+    atuin history start --hook -- 'echo MPZ_ACTUIN_POLICY_VISIBLE' \
+    2>/dev/null || true)
+  [[ -n "$visible_id" ]]
+}
+
+command -v git >/dev/null 2>&1 || die 'git is required'
+command -v zsh >/dev/null 2>&1 || die 'zsh is required'
+[[ -r "$LOCK" ]] || die "missing lock file: $LOCK"
+
+harden_powerlevel10k() {
+  local destination="$1"
+
+  chmod 0555 \
+    "$destination" \
+    "$destination/internal" \
+    "$destination/gitstatus"
+}
+
+verify_powerlevel10k_read_only() {
+  local destination="$1"
+  local directory
+
+  for directory in "$destination" "$destination/internal" "$destination/gitstatus"; do
+    [[ ! -w "$directory" ]] || \
+      die "$directory is writable; Powerlevel10k could compile files into vendor/ (run the installer)"
+  done
+}
+
+verify_vendor_checkout() {
+  local name="$1"
+  local commit="$2"
+  local destination="$ROOT/vendor/$name"
+
+  [[ -d "$destination/.git" ]] || die "$name is not installed in vendor/"
+  local actual
+  actual=$(git -C "$destination" rev-parse HEAD)
+  [[ "$actual" == "$commit" ]] || die "$name is pinned at $actual, expected $commit"
+  [[ -z "$(git -C "$destination" status --porcelain)" ]] || \
+    die "$name checkout has local changes"
+}
+
+stage_git_checkout() {
+  local name="$1"
+  local url="$2"
+  local commit="$3"
+  local staging_root="$4"
+  local destination="$ROOT/vendor/$name"
+  local staged="$staging_root/new/$name"
+  local current=''
+
+  if [[ -d "$destination/.git" ]]; then
+    if ! current=$(git -C "$destination" rev-parse HEAD); then
+      die "cannot resolve the current $name revision"
+    fi
+    local destination_status
+    if ! destination_status=$(git -C "$destination" status --porcelain); then
+      die "cannot inspect the current $name checkout"
+    fi
+    [[ -z "$destination_status" ]] || \
+      die "$destination has local changes; refusing to use or replace it"
+    if [[ "$current" == "$commit" ]]; then
+      log "$name is already pinned at $commit"
+      if [[ "$name" == powerlevel10k ]]; then
+        harden_powerlevel10k "$destination" || \
+          die "failed to make $destination read-only"
+      fi
+      return 1
+    fi
+    log "staging $name update to $commit"
+  else
+    [[ ! -e "$destination" ]] || die "$destination exists but is not a git checkout"
+    log "staging $name install at $commit"
+  fi
+
+  mkdir -p "$staged" || die "cannot create the staging directory for $name"
+  git -C "$staged" init -q || die "cannot initialize the staged checkout for $name"
+  git -C "$staged" remote add origin "$url" || \
+    die "cannot configure the staged remote for $name"
+  if ! git -C "$staged" fetch --depth 1 origin "$commit"; then
+    git -C "$staged" fetch --prune --tags origin || \
+      die "cannot fetch $name from $url"
+  fi
+  git -C "$staged" checkout --detach "$commit" || \
+    die "cannot check out the pinned $name revision"
+
+  local actual
+  actual=$(git -C "$staged" rev-parse HEAD) || \
+    die "cannot resolve the staged $name revision"
+  [[ "$actual" == "$commit" ]] || die "$name resolved to $actual, expected $commit"
+  local staged_status
+  if ! staged_status=$(git -C "$staged" status --porcelain); then
+    die "cannot inspect the staged $name checkout"
+  fi
+  [[ -z "$staged_status" ]] || \
+    die "$name staged checkout has local changes"
+  if [[ "$name" == powerlevel10k ]]; then
+    harden_powerlevel10k "$staged" || \
+      die "failed to make the staged Powerlevel10k checkout read-only"
+  fi
+  return 0
+}
+
+rollback_vendor_publish() {
+  local staging_root="$1"
+  local -n published_names_ref="$2"
+  local -n published_had_old_ref="$3"
+  local index name destination failed
+  local rollback_failed=0
+
+  for ((index = ${#published_names_ref[@]} - 1; index >= 0; index--)); do
+    name=${published_names_ref[index]}
+    destination="$ROOT/vendor/$name"
+    failed="$staging_root/failed/$name"
+    mkdir -p "${failed:h}"
+    if ! mv -f -- "$destination" "$failed"; then
+      rollback_failed=1
+      continue
+    fi
+    if [[ "${published_had_old_ref[index]}" == 1 ]]; then
+      if ! mv -f -- "$staging_root/old/$name" "$destination"; then
+        rollback_failed=1
+      fi
+    else
+      rm -rf -- "$destination"
+    fi
+  done
+
+  return "$rollback_failed"
+}
+
+publish_vendor_set() {
+  local staging_root="$1"
+  local name destination staged old had_old
+  local -a changed_names=()
+  local -a published_names=()
+  local -a published_had_old=()
+
+  while IFS= read -r name; do
+    changed_names+=("$name")
+  done < "$staging_root/changed"
+
+  for name in "${changed_names[@]}"; do
+    destination="$ROOT/vendor/$name"
+    staged="$staging_root/new/$name"
+    old="$staging_root/old/$name"
+    had_old=0
+
+    if [[ -e "$destination" || -L "$destination" ]]; then
+      mkdir -p "${old:h}"
+      if ! mv -- "$destination" "$old"; then
+        rollback_vendor_publish "$staging_root" published_names published_had_old || true
+        return 1
+      fi
+      had_old=1
+    fi
+
+    if ! mv -- "$staged" "$destination"; then
+      if ((had_old)); then
+        mv -f -- "$old" "$destination" || true
+      fi
+      rollback_vendor_publish "$staging_root" published_names published_had_old || true
+      return 1
+    fi
+    published_names+=("$name")
+    published_had_old+=("$had_old")
+    log "published $name"
+  done
+
+  return 0
+}
+
+check_tool() {
+  name=$1
+  expected=$2
+  if ! command -v "$name" >/dev/null 2>&1; then
+    warn "$name is not installed; the related integration will be unavailable"
+    return 0
+  fi
+  actual=$($name --version 2>/dev/null | head -n 1 | awk '{print $1}')
+  if [[ "$name" != fzf ]]; then
+    actual=$($name --version 2>/dev/null | head -n 1 | awk '{print $2}')
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    if (( ALLOW_DRIFT )); then
+      warn "$name $actual differs from tested $expected"
+    else
+      die "$name $actual differs from tested $expected (use --allow-version-drift)"
+    fi
+  else
+    log "$name $actual"
+  fi
+}
+
+configure_atuin() {
+  command -v atuin >/dev/null 2>&1 || {
+    warn 'atuin is not installed; skipping privacy configuration'
+    return 0
+  }
+
+  local config_dir="${ATUIN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/atuin}"
+  local config_file="$config_dir/config.toml"
+  local working_dir=''
+  local rewritten_config=''
+  local existing_filters=''
+  local merged_filters=''
+  local resolved_filters=''
+  local resolved_auto_sync=''
+  local resolved_update_check=''
+  local resolved_secrets_filter=''
+  local resolved_search_mode=''
+
+  if [[ -e "$config_dir" || -L "$config_dir" ]] && [[ ! -d "$config_dir" ]]; then
+    die "$config_dir is not a directory; refusing to configure Atuin"
+  fi
+  preflight_regular_or_absent "$config_file" "the Atuin configuration"
+
+  mkdir -p "$config_dir"
+  chmod 700 "$config_dir"
+
+  if [[ ! -f "$config_file" ]]; then
+    cp "$ROOT/config/atuin/config.toml" "$config_file"
+    chmod 600 "$config_file"
+    log 'created privacy-safe Atuin configuration'
+    return 0
+  fi
+
+  if [[ -L "$config_file.pre-mpz" ]]; then
+    local atuin_backup
+    atuin_backup=$(mktemp "$config_file.pre-mpz.$(date +%Y%m%d-%H%M%S).XXXXXX")
+    cp -p -- "$config_file" "$atuin_backup"
+  elif [[ ! -e "$config_file.pre-mpz" ]]; then
+    cp -p -- "$config_file" "$config_file.pre-mpz"
+  fi
+
+  # Apply every change to an isolated copy first. The active configuration is
+  # replaced only after Atuin can parse and resolve the rewritten file.
+  working_dir=$(mktemp -d "$config_dir/.rewrite.XXXXXX")
+  cp -p -- "$config_file" "$working_dir/config.toml"
+
+  if ! ATUIN_CONFIG_DIR="$working_dir" atuin config set auto_sync false; then
+    rm -rf -- "$working_dir"
+    die 'failed to disable Atuin automatic sync'
+  fi
+  if ! ATUIN_CONFIG_DIR="$working_dir" atuin config set update_check false; then
+    rm -rf -- "$working_dir"
+    die 'failed to disable Atuin update checks'
+  fi
+  if ! ATUIN_CONFIG_DIR="$working_dir" atuin config set secrets_filter true; then
+    rm -rf -- "$working_dir"
+    die 'failed to enable Atuin secret filtering'
+  fi
+  if ! ATUIN_CONFIG_DIR="$working_dir" atuin config set search_mode fuzzy; then
+    rm -rf -- "$working_dir"
+    die 'failed to select fuzzy Atuin search'
+  fi
+
+  # Atuin's CLI cannot assign sequence values, so preserve any user filters as
+  # a TOML-compatible array and write the result as a top-level TOML key.
+  existing_filters=$(ATUIN_CONFIG_DIR="$working_dir" atuin config get history_filter 2>/dev/null || true)
+  [[ "$existing_filters" == \[* ]] || existing_filters='[]'
+
+  if atuin_has_exact_whitespace_filter "$existing_filters"; then
+    merged_filters="$existing_filters"
+  elif [[ "$existing_filters" == '[]' ]]; then
+    merged_filters='["^\\s+"]'
+  else
+    merged_filters=$(printf '%s\n' "$existing_filters" | sed 's/^\[/["^\\\\s+", /')
+  fi
+
+  rewritten_config=$(mktemp "$working_dir/config.toml.rewritten.XXXXXX")
+  if ! MPZ_HISTORY_FILTER="$merged_filters" awk '
+    function bracket_delta(text,    position, character, quoted, literal, escaped, delta, backslash, double_quote, single_quote) {
+      quoted = 0
+      literal = 0
+      escaped = 0
+      delta = 0
+      backslash = sprintf("%c", 92)
+      double_quote = sprintf("%c", 34)
+      single_quote = sprintf("%c", 39)
+      for (position = 1; position <= length(text); position++) {
+        character = substr(text, position, 1)
+        if (literal) {
+          if (character == single_quote) {
+            literal = 0
+          }
+        } else if (quoted) {
+          if (escaped) {
+            escaped = 0
+          } else if (character == backslash) {
+            escaped = 1
+          } else if (character == double_quote) {
+            quoted = 0
+          }
+        } else if (character == double_quote) {
+          quoted = 1
+        } else if (character == single_quote) {
+          literal = 1
+        } else if (character == "#") {
+          break
+        } else if (character == "[") {
+          delta++
+        } else if (character == "]") {
+          delta--
+        }
+      }
+      return delta
+    }
+
+    BEGIN {
+      replacement = ENVIRON["MPZ_HISTORY_FILTER"]
+      inserted = 0
+      skipping_filter = 0
+      filter_depth = 0
+    }
+
+    /^[[:space:]]*\[/ {
+      if (!inserted) {
+        print "history_filter = " replacement
+        print ""
+        inserted = 1
+      }
+    }
+
+    /^[[:space:]]*history_filter[[:space:]]*=/ {
+      skipping_filter = 1
+      filter_depth = bracket_delta($0)
+      if (filter_depth <= 0) {
+        skipping_filter = 0
+      }
+      next
+    }
+
+    skipping_filter {
+      filter_depth += bracket_delta($0)
+      if (filter_depth <= 0) {
+        skipping_filter = 0
+      }
+      next
+    }
+
+    { print }
+
+    END {
+      if (!inserted) {
+        print "history_filter = " replacement
+      }
+    }
+  ' "$working_dir/config.toml" > "$rewritten_config"; then
+    rm -f -- "$rewritten_config"
+    rm -rf -- "$working_dir"
+    die 'failed to rewrite Atuin history_filter'
+  fi
+  chmod 600 "$rewritten_config"
+  mv -f -- "$rewritten_config" "$working_dir/config.toml"
+
+  resolved_filters=$(ATUIN_CONFIG_DIR="$working_dir" atuin config get history_filter 2>/dev/null || true)
+  if [[ "$resolved_filters" != \[* ]] || \
+    ! atuin_has_exact_whitespace_filter "$resolved_filters"; then
+    rm -rf -- "$working_dir"
+    die 'Atuin history_filter does not contain the exact leading-whitespace exclusion'
+  fi
+  if ! atuin_filter_rejects_leading_whitespace "$working_dir"; then
+    rm -rf -- "$working_dir"
+    die 'Atuin history_filter does not reject leading-whitespace commands'
+  fi
+  resolved_auto_sync=$(ATUIN_CONFIG_DIR="$working_dir" atuin config get auto_sync 2>/dev/null || true)
+  resolved_update_check=$(ATUIN_CONFIG_DIR="$working_dir" atuin config get update_check 2>/dev/null || true)
+  resolved_secrets_filter=$(ATUIN_CONFIG_DIR="$working_dir" atuin config get secrets_filter 2>/dev/null || true)
+  resolved_search_mode=$(ATUIN_CONFIG_DIR="$working_dir" atuin config get search_mode 2>/dev/null || true)
+  if [[ "$resolved_auto_sync" != false || \
+    "$resolved_update_check" != false || \
+    "$resolved_secrets_filter" != true || \
+    "$resolved_search_mode" != fuzzy ]]; then
+    rm -rf -- "$working_dir"
+    die 'rewritten Atuin configuration does not satisfy the privacy policy'
+  fi
+
+  mv -f -- "$working_dir/config.toml" "$config_file"
+  rm -rf -- "$working_dir"
+  log 'updated Atuin privacy settings'
+}
+
+preflight_regular_or_absent() {
+  local path="$1"
+  local description="$2"
+
+  if [[ -e "$path" || -L "$path" ]] && [[ ! -f "$path" ]]; then
+    die "$path is not a regular file or symlink to a regular file; refusing to replace $description"
+  fi
+}
+
+preflight_startup_file() {
+  local name="$1"
+  local current="$HOME/$name"
+  local parent="${current%/*}"
+
+  preflight_regular_or_absent "$current" "$current"
+  if [[ ! -d "$parent" || ! -w "$parent" ]]; then
+    die "$parent is not a writable directory; refusing to replace $current"
+  fi
+}
+
+link_startup_file() {
+  local name="$1"
+  local target="$2"
+  local current="$HOME/$name"
+  local backup="$current.pre-mpz"
+  local record="${XDG_CONFIG_HOME:-$HOME/.config}/my-perfect-zsh/rollback-${name}-path"
+
+  if [[ -L "$current" && "$(readlink "$current")" == "$target" ]]; then
+    log "$current already links to this repository"
+    return 0
+  fi
+
+  if [[ -d "$current" ]]; then
+    die "$current is a directory; refusing to replace it"
+  fi
+
+  if [[ -e "$current" || -L "$current" ]]; then
+    if [[ -e "$backup" || -L "$backup" ]]; then
+      backup=$(mktemp "$current.pre-mpz.$(date +%Y%m%d-%H%M%S).XXXXXX")
+    fi
+    if [[ -L "$current" ]]; then
+      cp -P -p -- "$current" "$backup"
+    else
+      cp -p -- "$current" "$backup"
+    fi
+    mkdir -p "$(dirname -- "$record")"
+    chmod 700 "$(dirname -- "$record")"
+    printf '%s\n' "$backup" > "$record"
+    log "backed up $current to $backup"
+  else
+    # A stale rollback record must not restore a file that did not exist when
+    # this installation created the startup-file link.
+    rm -f -- "$record"
+  fi
+
+  local temporary_dir
+  local temporary
+  temporary_dir=$(mktemp -d "$(dirname -- "$current")/.mpz-link.XXXXXX")
+  temporary="$temporary_dir/startup"
+  if ! ln -s "$target" "$temporary"; then
+    rmdir -- "$temporary_dir" 2>/dev/null || true
+    die "failed to create the replacement link for $current"
+  fi
+  if ! mv -f "$temporary" "$current"; then
+    rm -f -- "$temporary"
+    rmdir -- "$temporary_dir" 2>/dev/null || true
+    die "failed to replace $current"
+  fi
+  rmdir -- "$temporary_dir" 2>/dev/null || true
+  log "linked $current to $target"
+}
+
+declare -a GIT_NAMES=()
+declare -a GIT_URLS=()
+declare -a GIT_COMMITS=()
+declare -a TOOL_NAMES=()
+declare -a TOOL_VERSIONS=()
+
+while read -r kind name argument version; do
+  [[ -z "$kind" || "$kind" == \#* ]] && continue
+  case "$kind" in
+    git)
+      GIT_NAMES+=("$name")
+      GIT_URLS+=("$argument")
+      GIT_COMMITS+=("$version")
+      ;;
+    tool)
+      TOOL_NAMES+=("$name")
+      TOOL_VERSIONS+=("$argument")
+      ;;
+    *)
+      die "unknown dependency kind '$kind' in $LOCK"
+      ;;
+  esac
+done < "$LOCK"
+
+for index in "${!TOOL_NAMES[@]}"; do
+  check_tool "${TOOL_NAMES[index]}" "${TOOL_VERSIONS[index]}"
+done
+
+if (( LINK_ZSHRC )); then
+  preflight_startup_file '.zshrc'
+  preflight_startup_file '.zshenv'
+fi
+
+if (( INSTALL_DEPS )); then
+  mkdir -p "$ROOT/vendor"
+  STAGING_ROOT=$(mktemp -d "$ROOT/vendor/.mpz-stage.XXXXXX")
+  mkdir -p "$STAGING_ROOT/new" "$STAGING_ROOT/old" "$STAGING_ROOT/failed"
+  : > "$STAGING_ROOT/changed"
+
+  for index in "${!GIT_NAMES[@]}"; do
+    if stage_git_checkout \
+      "${GIT_NAMES[index]}" \
+      "${GIT_URLS[index]}" \
+      "${GIT_COMMITS[index]}" \
+      "$STAGING_ROOT"; then
+      printf '%s\n' "${GIT_NAMES[index]}" >> "$STAGING_ROOT/changed"
+    fi
+  done
+
+  if [[ -s "$STAGING_ROOT/changed" ]]; then
+    if ! publish_vendor_set "$STAGING_ROOT"; then
+      die 'failed to publish the staged vendor set; existing checkouts were rolled back'
+    fi
+  fi
+  rm -rf -- "$STAGING_ROOT"
+  STAGING_ROOT=''
+else
+  for index in "${!GIT_NAMES[@]}"; do
+    verify_vendor_checkout "${GIT_NAMES[index]}" "${GIT_COMMITS[index]}"
+  done
+  if [[ "$MODE" == check ]]; then
+    verify_powerlevel10k_read_only "$ROOT/vendor/powerlevel10k"
+  else
+    harden_powerlevel10k "$ROOT/vendor/powerlevel10k"
+  fi
+fi
+
+if (( CONFIGURE_ATUIN )); then
+  configure_atuin
+fi
+
+if (( LINK_ZSHRC )); then
+  link_startup_file '.zshrc' "$ROOT/.zshrc"
+  link_startup_file '.zshenv' "$ROOT/.zshenv"
+fi
+
+if [[ "$MODE" == check ]]; then
+  log 'dependency check passed'
+fi

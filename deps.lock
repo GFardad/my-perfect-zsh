@@ -1,0 +1,17 @@
+# Deterministic dependency lock for My Perfect ZSH.
+#
+# git <name> <repository> <commit>
+# tool <name> <tested-version>
+#
+# The installer checks source checkouts by exact commit and external tools by
+# exact tested version. Use --allow-version-drift for a newer system package.
+
+git powerlevel10k https://github.com/romkatv/powerlevel10k.git 50a35cc8d9f1488d18fb8aea6cddcfc31189cc9f
+git fzf-tab https://github.com/Aloxaf/fzf-tab.git fac145167f7ec1861233c54de0c8900b09c650fe
+git zsh-autosuggestions https://github.com/zsh-users/zsh-autosuggestions.git 85919cd1ffa7d2d5412f6d3fe437ebdbeeec4fc5
+git fast-syntax-highlighting https://github.com/zdharma-continuum/fast-syntax-highlighting.git 3d574ccf48804b10dca52625df13da5edae7f553
+git fzf https://github.com/junegunn/fzf.git c7bf2b8eea25952dd257a466c0afa72faae206fb
+
+tool atuin 18.24.8
+tool zoxide 0.10.0
+tool fzf 0.75.0

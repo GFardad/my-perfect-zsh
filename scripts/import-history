@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OLD_HISTORY=${1:-$HOME/.zsh_history}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}
+ZSH_STATE_DIR="$STATE_DIR/zsh"
+NEW_HISTORY="$ZSH_STATE_DIR/history"
+MARKER="$ZSH_STATE_DIR/.legacy-history-imported"
+JOURNAL="$ZSH_STATE_DIR/.legacy-import.journal"
+TRANSACTION_DIR=''
+TEMPORARY_MARKER=''
+
+log() { printf 'import-history: %s\n' "$*"; }
+die() { printf 'import-history: error: %s\n' "$*" >&2; exit 1; }
+
+remove_transaction() {
+  [[ -z "$TRANSACTION_DIR" ]] || rm -rf -- "$TRANSACTION_DIR"
+  TRANSACTION_DIR=''
+  rm -f -- "$JOURNAL"
+}
+
+complete_marker() {
+  TEMPORARY_MARKER=$(mktemp "$ZSH_STATE_DIR/.legacy-marker.XXXXXX")
+  : > "$TEMPORARY_MARKER"
+  chmod 600 "$TEMPORARY_MARKER"
+  mv -f -- "$TEMPORARY_MARKER" "$MARKER"
+  TEMPORARY_MARKER=''
+}
+
+write_phase() {
+  local transaction="$1"
+  local phase="$2"
+  printf '%s\n' "$phase" > "$transaction/phase.tmp"
+  mv -f -- "$transaction/phase.tmp" "$transaction/phase"
+}
+
+recover_transaction() {
+  local transaction phase
+  [[ -e "$JOURNAL" || -L "$JOURNAL" ]] || return 0
+
+  if [[ -L "$JOURNAL" ]]; then
+    die "refusing a symlinked import journal: $JOURNAL"
+  fi
+  IFS= read -r transaction < "$JOURNAL" || true
+  [[ -n "$transaction" ]] || die "the import journal is empty: $JOURNAL"
+  case "$transaction" in
+    "$ZSH_STATE_DIR"/.legacy-import.*) ;;
+    *) die "refusing an unexpected import journal path: $transaction" ;;
+  esac
+  [[ -d "$transaction" ]] || die "the import transaction is missing: $transaction"
+
+  if [[ -e "$MARKER" ]]; then
+    rm -rf -- "$transaction"
+    rm -f -- "$JOURNAL"
+    return 0
+  fi
+
+  phase=''
+  [[ -r "$transaction/phase" ]] && phase=$(<"$transaction/phase")
+  case "$phase" in
+    prepared)
+      if [[ -f "$transaction/history.next" ]] && \
+        cmp -s -- "$transaction/history.next" "$NEW_HISTORY"; then
+        complete_marker
+        rm -rf -- "$transaction"
+        rm -f -- "$JOURNAL"
+        log 'recovered a completed history installation and finalized its marker'
+      else
+        if [[ -f "$transaction/history.before" ]]; then
+          cp -p -- "$transaction/history.before" "$NEW_HISTORY.restore.tmp"
+          chmod 600 "$NEW_HISTORY.restore.tmp"
+          mv -f -- "$NEW_HISTORY.restore.tmp" "$NEW_HISTORY"
+        elif [[ -e "$transaction/no-history" ]]; then
+          rm -f -- "$NEW_HISTORY"
+        fi
+        rm -rf -- "$transaction"
+        rm -f -- "$JOURNAL"
+        log 'rolled back an interrupted history installation'
+      fi
+      ;;
+    installed)
+      complete_marker
+      rm -rf -- "$transaction"
+      rm -f -- "$JOURNAL"
+      log 'recovered an installed history file and finalized its marker'
+      ;;
+    marked)
+      rm -rf -- "$transaction"
+      rm -f -- "$JOURNAL"
+      ;;
+    *)
+      rm -rf -- "$transaction"
+      rm -f -- "$JOURNAL"
+      ;;
+  esac
+}
+
+on_exit() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$TEMPORARY_MARKER" ]]; then
+    rm -f -- "$TEMPORARY_MARKER"
+  fi
+  if ((status != 0)) && [[ -e "$JOURNAL" || -L "$JOURNAL" ]]; then
+    recover_transaction || true
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+
+if [[ -e "$MARKER" || -L "$MARKER" ]]; then
+  recover_transaction
+  printf 'import-history: legacy history was already imported; skipping\n'
+  exit 0
+fi
+
+recover_transaction
+if [[ -e "$MARKER" || -L "$MARKER" ]]; then
+  printf 'import-history: legacy history was already imported; skipping\n'
+  exit 0
+fi
+
+if [[ ! -f "$OLD_HISTORY" ]]; then
+  printf 'import-history: %s does not exist; nothing to import\n' "$OLD_HISTORY"
+  exit 0
+fi
+
+mkdir -p "$ZSH_STATE_DIR"
+chmod 700 "$ZSH_STATE_DIR"
+
+TRANSACTION_DIR=$(mktemp -d "$ZSH_STATE_DIR/.legacy-import.XXXXXX")
+chmod 700 "$TRANSACTION_DIR"
+printf '%s\n' "$TRANSACTION_DIR" > "$JOURNAL.tmp"
+mv -f -- "$JOURNAL.tmp" "$JOURNAL"
+
+if [[ -e "$NEW_HISTORY" || -L "$NEW_HISTORY" ]]; then
+  [[ -f "$NEW_HISTORY" ]] || die "$NEW_HISTORY is not a regular history file"
+  cp -p -- "$NEW_HISTORY" "$TRANSACTION_DIR/history.before"
+  if [[ -e "$NEW_HISTORY.pre-import" || -L "$NEW_HISTORY.pre-import" ]]; then
+    backup_path=$(mktemp \
+      "$NEW_HISTORY.pre-import.$(date +%Y%m%d-%H%M%S).XXXXXX")
+  else
+    backup_path="$NEW_HISTORY.pre-import"
+  fi
+  cp -p -- "$NEW_HISTORY" "$backup_path"
+  chmod 600 "$backup_path"
+  printf '%s\n' "$backup_path" > "$TRANSACTION_DIR/backup-path"
+else
+  : > "$TRANSACTION_DIR/no-history"
+fi
+
+# Zsh writes a multiline command as consecutive physical lines, with a
+# trailing backslash marking continuation. Parse logical records before
+# applying the leading-whitespace policy so a private continuation cannot
+# leak and a visible continuation cannot be truncated.
+LC_ALL=C awk -v count_file="$TRANSACTION_DIR/count" \
+  -v total_file="$TRANSACTION_DIR/total" '
+  function ends_with_continuation(text,    count) {
+    count = 0
+    while (text ~ /\\$/) {
+      sub(/\\$/, "", text)
+      count++
+    }
+    return count % 2 == 1
+  }
+
+  function flush_record(    separator, command, keep) {
+    if (!in_record) {
+      return
+    }
+
+    total++
+    if (record ~ /^: [0-9]+:[0-9]+;/) {
+      separator = index(record, ";")
+      command = substr(record, separator + 1)
+    } else {
+      command = record
+    }
+    keep = command !~ /^[[:space:]]/
+    if (keep) {
+      print record
+      imported++
+    }
+
+    in_record = 0
+    record = ""
+  }
+
+  BEGIN {
+    in_record = 0
+    record = ""
+    imported = 0
+    total = 0
+  }
+
+  {
+    if (!in_record) {
+      record = $0
+      in_record = 1
+    } else {
+      record = record "\n" $0
+    }
+    if (!ends_with_continuation($0)) {
+      flush_record()
+    }
+  }
+
+  END {
+    flush_record()
+    printf "%d\n", imported > count_file
+    printf "%d\n", total > total_file
+    close(count_file)
+    close(total_file)
+  }
+' "$OLD_HISTORY" > "$TRANSACTION_DIR/history.filtered"
+
+: > "$TRANSACTION_DIR/history.next"
+cat -- "$TRANSACTION_DIR/history.filtered" >> "$TRANSACTION_DIR/history.next"
+if [[ -f "$TRANSACTION_DIR/history.before" ]]; then
+  cat -- "$TRANSACTION_DIR/history.before" >> "$TRANSACTION_DIR/history.next"
+fi
+chmod 600 "$TRANSACTION_DIR/history.next"
+write_phase "$TRANSACTION_DIR" prepared
+
+if [[ ${MPZ_HISTORY_IMPORT_TEST_CRASH-} == after-prepared ]]; then
+  kill -KILL $$
+fi
+
+cp -p -- "$TRANSACTION_DIR/history.next" "$TRANSACTION_DIR/history.publish"
+chmod 600 "$TRANSACTION_DIR/history.publish"
+mv -f -- "$TRANSACTION_DIR/history.publish" "$NEW_HISTORY"
+
+if [[ ${MPZ_HISTORY_IMPORT_TEST_CRASH-} == after-history ]]; then
+  kill -KILL $$
+fi
+
+write_phase "$TRANSACTION_DIR" installed
+complete_marker
+write_phase "$TRANSACTION_DIR" marked
+
+IMPORTED=$(<"$TRANSACTION_DIR/count")
+TOTAL=$(<"$TRANSACTION_DIR/total")
+SKIPPED=$((TOTAL - IMPORTED))
+rm -rf -- "$TRANSACTION_DIR"
+TRANSACTION_DIR=''
+rm -f -- "$JOURNAL"
+
+printf 'import-history: imported %d commands into %s\n' "$IMPORTED" "$NEW_HISTORY"
+printf 'import-history: excluded %d leading-whitespace commands\n' "$SKIPPED"
+printf 'import-history: the import marker prevents repeated concatenation\n'

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+STATUS=0
+
+restore_startup_file() {
+  local name="$1"
+  local target="$2"
+  local current="$HOME/$name"
+  local record="${XDG_CONFIG_HOME:-$HOME/.config}/my-perfect-zsh/rollback-${name}-path"
+  local backup="$current.pre-mpz"
+
+  if [[ ! -L "$current" ]]; then
+    printf 'uninstall: %s is not a symlink; leaving it unchanged\n' "$current"
+    return 0
+  fi
+
+  local linked_target
+  linked_target=$(readlink "$current")
+  if [[ "$linked_target" != "$target" ]]; then
+    printf 'uninstall: %s points to %s, not this repository; leaving it unchanged\n' \
+      "$current" "$linked_target" >&2
+    STATUS=1
+    return 0
+  fi
+
+  if [[ -r "$record" ]]; then
+    local recorded
+    read -r recorded < "$record"
+    [[ -z "$recorded" ]] || backup="$recorded"
+  fi
+
+  local backup_name backup_parent
+  backup_name=$(basename -- "$backup")
+  backup_parent=$(dirname -- "$backup")
+  case "$backup_name" in
+    "$name.pre-mpz" | "$name.pre-mpz".*) ;;
+    *)
+      printf 'uninstall: refusing unexpected rollback path %s\n' "$backup" >&2
+      STATUS=1
+      return 0
+      ;;
+  esac
+  if [[ "$backup_parent" != "${current%/*}" ]]; then
+    printf 'uninstall: refusing rollback path outside %s\n' "${current%/*}" >&2
+    STATUS=1
+    return 0
+  fi
+
+  if [[ -e "$backup" || -L "$backup" ]]; then
+    local temporary_dir temporary
+    temporary_dir=$(mktemp -d "$(dirname -- "$current")/.mpz-restore.XXXXXX")
+    temporary="$temporary_dir/startup"
+    if ! cp -P -p -- "$backup" "$temporary"; then
+      rm -rf -- "$temporary_dir"
+      printf 'uninstall: could not stage %s; leaving %s unchanged\n' \
+        "$backup" "$current" >&2
+      STATUS=1
+      return 0
+    fi
+    if ! mv -fT -- "$temporary" "$current"; then
+      rm -rf -- "$temporary_dir"
+      printf 'uninstall: could not restore %s; leaving it unchanged\n' "$current" >&2
+      STATUS=1
+      return 0
+    fi
+    rmdir -- "$temporary_dir" 2>/dev/null || true
+    rm -f -- "$backup"
+    printf 'uninstall: restored %s\n' "$current"
+  else
+    rm -f -- "$current"
+    printf 'uninstall: removed %s; no rollback file was found\n' "$current"
+  fi
+  rm -f -- "$record"
+}
+
+restore_startup_file '.zshrc' "$ROOT/.zshrc"
+restore_startup_file '.zshenv' "$ROOT/.zshenv"
+
+printf 'uninstall: vendor, local configuration, and history were preserved\n'
+exit "$STATUS"
