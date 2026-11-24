@@ -1,0 +1,924 @@
+#!/usr/bin/env bash
+# On-demand machine-local configuration wizard.
+#
+# The wizard only ever writes <config dir>/local.d/50-wizard.zsh. It never edits
+# published core files, never runs at startup, and never publishes a change that
+# has not first been validated in an isolated Zsh.
+#
+# Managed values are read back from the managed file, so the generated file is
+# the single source of truth and every run is deterministic: the same settings
+# always produce byte-identical output.
+#
+# The embedded Zsh snippets are handed to Zsh literally, so they stay in single
+# quotes; the resulting SC2016 notes are expected.
+# shellcheck disable=SC2016
+
+set -euo pipefail
+
+PROGRAM='wizard'
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+MANAGED_NAME='50-wizard.zsh'
+
+# Managed settings, in the order they appear in the generated file.
+FIELD_KEYS=('history_size' 'autosuggest_highlight' \
+  'prompt_left_elements' 'prompt_right_elements')
+HISTORY_SIZE_MAX=1000000
+PROMPT_ELEMENT_MAX=16
+
+CONFIG_DIR=''
+LOCAL_DIR=''
+MANAGED_FILE=''
+MODE=''
+declare -a REQUEST_SET=()
+declare -a REQUEST_UNSET=()
+declare -a STATE=()
+
+log() { printf '%s: %s\n' "$PROGRAM" "$*"; }
+warn() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+usage_error() {
+  printf '%s: error: %s\n' "$PROGRAM" "$*" >&2
+  usage >&2
+  exit 2
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/wizard [options] [--set setting=value]... [--unset setting]...
+
+Customizes machine-local policy only. Writes <config dir>/local.d/50-wizard.zsh
+and never changes published core files or startup files. Preview is the default;
+--apply is required before anything is written.
+
+Options:
+  --config DIR   machine-local configuration directory
+                 (default: $MPZ_USER_CONFIG_DIR, else $XDG_CONFIG_HOME/my-perfect-zsh)
+  --apply        write the managed file after validating it in an isolated Zsh
+  --print        preview the proposed file; changes nothing (default)
+  --show         print the current managed settings
+  --tui          open the interactive wizard (one key per line when piped)
+  --set S=V      set one managed setting (repeatable)
+  --unset S      drop one managed setting (repeatable)
+  -h, --help     show this help
+
+Managed settings:
+  history_size            HISTSIZE, 1..1000000
+  autosuggest_highlight   ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE, empty clears
+  prompt_left_elements    POWERLEVEL9K_LEFT_PROMPT_ELEMENTS, comma-separated
+  prompt_right_elements   POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS, comma-separated
+
+Examples:
+  scripts/wizard --show
+  scripts/wizard --set history_size=20000 --print
+  scripts/wizard --set prompt_right_elements=status,time --apply
+  scripts/wizard --unset prompt_left_elements --apply
+  scripts/wizard --tui
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Settings registry
+# ---------------------------------------------------------------------------
+
+is_known_field() {
+  local key="$1" candidate
+  for candidate in "${FIELD_KEYS[@]}"; do
+    [[ "$candidate" == "$key" ]] && return 0
+  done
+  return 1
+}
+
+field_parameter() {
+  case "$1" in
+    history_size) printf 'HISTSIZE\n' ;;
+    autosuggest_highlight) printf 'ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE\n' ;;
+    prompt_left_elements) printf 'POWERLEVEL9K_LEFT_PROMPT_ELEMENTS\n' ;;
+    prompt_right_elements) printf 'POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+field_state_index() {
+  local key="$1" index
+  for index in "${!FIELD_KEYS[@]}"; do
+    if [[ "${FIELD_KEYS[index]}" == "$key" ]]; then
+      printf '%d' "$index"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# A normalizer prints either the canonical value or, on failure, the reason the
+# value was rejected. The reason is returned through stdout because a command
+# substitution runs in a subshell and cannot export a variable.
+field_normalize() {
+  local key="$1" value="$2"
+  case "$key" in
+    history_size) normalize_history_size "$value" ;;
+    autosuggest_highlight) normalize_autosuggest_highlight "$value" ;;
+    prompt_left_elements) normalize_prompt_elements "$value" 'prompt_left_elements' ;;
+    prompt_right_elements) normalize_prompt_elements "$value" 'prompt_right_elements' ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_history_size() {
+  local value="$1" digits number
+  digits="${value#"${value%%[!0]*}"}"
+  [[ -n "$digits" ]] || digits=0
+
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( ${#digits} > 7 )) || (( 10#$digits > HISTORY_SIZE_MAX )); then
+    printf 'history_size must be a positive integer between 1 and %d\n' "$HISTORY_SIZE_MAX"
+    return 1
+  fi
+
+  number=$((10#$digits))
+  if (( number < 1 )); then
+    printf 'history_size must be a positive integer between 1 and %d\n' "$HISTORY_SIZE_MAX"
+    return 1
+  fi
+  printf '%d' "$number"
+}
+
+normalize_autosuggest_highlight() {
+  local value="$1" pattern='^[A-Za-z0-9][A-Za-z0-9,:./=+_ -]*$'
+
+  # An empty value clears the machine-local style so the core default applies.
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+
+  # Double quotes and shell metacharacters are rejected because the generated
+  # file wraps this value in double quotes.
+  if [[ ! "$value" =~ $pattern ]]; then
+    printf 'autosuggest_highlight must start with a letter or digit and use only letters, digits, and the characters , : . / = + space _ -\n'
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+normalize_prompt_elements() {
+  local value="$1" label="$2"
+  local -a clean=()
+  local remaining element word joined seen
+
+  if [[ "$value" == *, ]]; then
+    printf '%s must be a comma-separated list without a trailing comma\n' "$label"
+    return 1
+  fi
+
+  remaining="$value"
+  while [[ -n "$remaining" ]]; do
+    element=${remaining%%,*}
+    if [[ "$element" == "$remaining" ]]; then
+      remaining=''
+    else
+      remaining=${remaining#*,}
+    fi
+
+    element="${element#"${element%%[![:space:]]*}"}"
+    element="${element%"${element##*[![:space:]]}"}"
+
+    if [[ -z "$element" ]]; then
+      printf '%s must be a comma-separated list of Powerlevel10k element names\n' "$label"
+      return 1
+    fi
+    if [[ ! "$element" =~ ^[a-z][a-z0-9_]*$ ]]; then
+      printf '%s must use Powerlevel10k element names: lowercase letters, digits, and underscores\n' "$label"
+      return 1
+    fi
+    for seen in "${clean[@]}"; do
+      if [[ "$seen" == "$element" ]]; then
+        printf '%s repeats the element %s\n' "$label" "$element"
+        return 1
+      fi
+    done
+    clean+=("$element")
+  done
+
+  if (( ${#clean[@]} > PROMPT_ELEMENT_MAX )); then
+    printf '%s accepts at most %d elements\n' "$label" "$PROMPT_ELEMENT_MAX"
+    return 1
+  fi
+
+  joined=''
+  for word in "${clean[@]}"; do
+    if [[ -n "$joined" ]]; then
+      joined+=" $word"
+    else
+      joined="$word"
+    fi
+  done
+  printf '%s' "$joined"
+}
+
+# Canonical values are stored space-separated; input and display use commas.
+field_display() {
+  local key="$1" value="$2"
+  case "$key" in
+    prompt_left_elements | prompt_right_elements) printf '%s' "${value// /,}" ;;
+    *) printf '%s' "$value" ;;
+  esac
+}
+
+field_declaration() {
+  local key="$1" value="$2"
+  case "$key" in
+    history_size) printf 'typeset -g HISTSIZE=%s\n' "$value" ;;
+    autosuggest_highlight) printf 'typeset -g ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE="%s"\n' "$value" ;;
+    prompt_left_elements) printf 'typeset -g POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(%s)\n' "$value" ;;
+    prompt_right_elements) printf 'typeset -g POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(%s)\n' "$value" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Read the canonical value a managed key currently holds, or nothing.
+field_current() {
+  local key="$1" parameter line name raw='' joined word
+  local -a words=()
+
+  parameter=$(field_parameter "$key") || return 1
+  [[ -r "$MANAGED_FILE" ]] || return 0
+
+  while IFS= read -r line; do
+    [[ "$line" == 'typeset -g '*=* ]] || continue
+    name=${line#'typeset -g '}
+    name=${name%%=*}
+    [[ "$name" == "$parameter" ]] || continue
+    raw=${line#*=}
+    raw=${raw%"${raw##*[![:space:]]}"}
+    break
+  done < "$MANAGED_FILE"
+
+  [[ -n "$raw" ]] || return 0
+
+  case "$key" in
+    prompt_left_elements | prompt_right_elements)
+      raw=${raw#(}
+      raw=${raw%)}
+      read -r -a words <<< "$raw"
+      joined=''
+      for word in "${words[@]}"; do
+        if [[ -n "$joined" ]]; then
+          joined+=",$word"
+        else
+          joined="$word"
+        fi
+      done
+      printf '%s' "$joined"
+      ;;
+    autosuggest_highlight)
+      raw=${raw#\"}
+      raw=${raw%\"}
+      printf '%s' "$raw"
+      ;;
+    *)
+      printf '%s' "$raw"
+      ;;
+  esac
+}
+
+load_state() {
+  local index key current
+  STATE=()
+  for index in "${!FIELD_KEYS[@]}"; do
+    key=${FIELD_KEYS[index]}
+    current=$(field_current "$key")
+    STATE+=("$current")
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Options and paths
+# ---------------------------------------------------------------------------
+
+resolve_config_dir() {
+  if [[ -n "$CONFIG_DIR" ]]; then
+    return 0
+  fi
+  if [[ -n "${MPZ_USER_CONFIG_DIR:-}" ]]; then
+    CONFIG_DIR="$MPZ_USER_CONFIG_DIR"
+    return 0
+  fi
+  local base="${XDG_CONFIG_HOME:-${HOME:-}}"
+  [[ -n "$base" ]] || die 'no configuration directory: set --config, MPZ_USER_CONFIG_DIR, XDG_CONFIG_HOME, or HOME'
+  CONFIG_DIR="$base/my-perfect-zsh"
+}
+
+preflight() {
+  if [[ -e "$CONFIG_DIR" || -L "$CONFIG_DIR" ]] && [[ ! -d "$CONFIG_DIR" ]]; then
+    die "$CONFIG_DIR is not a directory; refusing to write machine-local configuration"
+  fi
+
+  LOCAL_DIR="$CONFIG_DIR/local.d"
+  if [[ -e "$LOCAL_DIR" || -L "$LOCAL_DIR" ]] && [[ ! -d "$LOCAL_DIR" ]]; then
+    die "$LOCAL_DIR is not a directory; refusing to write machine-local configuration"
+  fi
+
+  MANAGED_FILE="$LOCAL_DIR/$MANAGED_NAME"
+  if [[ -L "$MANAGED_FILE" ]]; then
+    die "$MANAGED_FILE is a symlink; refusing to replace it"
+  fi
+  if [[ -e "$MANAGED_FILE" ]] && [[ ! -f "$MANAGED_FILE" ]]; then
+    die "$MANAGED_FILE is not a regular file; refusing to replace it"
+  fi
+}
+
+# Validate every requested change before a single byte is written.
+apply_requests() {
+  local entry key value normalized index
+
+  for entry in "${REQUEST_SET[@]}"; do
+    if [[ "$entry" != *=* ]]; then
+      usage_error "--set needs setting=value, got '$entry'"
+    fi
+    key=${entry%%=*}
+    value=${entry#*=}
+    is_known_field "$key" || usage_error "unknown setting '$key'; run --help for the managed settings"
+    index=$(field_state_index "$key")
+    normalized=$(field_normalize "$key" "$value") || die "$normalized"
+    STATE[index]="$normalized"
+  done
+
+  for key in "${REQUEST_UNSET[@]}"; do
+    is_known_field "$key" || usage_error "unknown setting '$key'; run --help for the managed settings"
+    index=$(field_state_index "$key")
+    STATE[index]=''
+  done
+}
+
+while (($#)); do
+  case "$1" in
+    --config)
+      (($# >= 2)) || usage_error '--config needs a directory'
+      [[ -n "$2" ]] || usage_error '--config needs a directory'
+      CONFIG_DIR="$2"
+      shift 2
+      ;;
+    --config=*)
+      CONFIG_DIR=${1#*=}
+      [[ -n "$CONFIG_DIR" ]] || usage_error '--config needs a directory'
+      shift
+      ;;
+    --apply | --print | --show | --tui)
+      if [[ -n "$MODE" ]]; then
+        usage_error "conflicting modes: --$MODE and --${1#--}"
+      fi
+      MODE=${1#--}
+      shift
+      ;;
+    --set)
+      (($# >= 2)) || usage_error '--set needs setting=value'
+      REQUEST_SET+=("$2")
+      shift 2
+      ;;
+    --set=*)
+      REQUEST_SET+=("${1#*=}")
+      shift
+      ;;
+    --unset)
+      (($# >= 2)) || usage_error '--unset needs a setting'
+      REQUEST_UNSET+=("$2")
+      shift 2
+      ;;
+    --unset=*)
+      REQUEST_UNSET+=("${1#*=}")
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage_error "unknown option: $1"
+      ;;
+  esac
+done
+
+if [[ -z "$MODE" ]]; then
+  if (( ${#REQUEST_SET[@]} || ${#REQUEST_UNSET[@]} )); then
+    # Writing is always explicit.
+    MODE='print'
+  elif [[ -t 0 ]]; then
+    MODE='tui'
+  else
+    MODE='show'
+  fi
+fi
+
+if [[ "$MODE" == show ]] && (( ${#REQUEST_SET[@]} || ${#REQUEST_UNSET[@]} )); then
+  usage_error '--show cannot be combined with --set or --unset'
+fi
+
+# ---------------------------------------------------------------------------
+# Proposed content
+# ---------------------------------------------------------------------------
+
+if ! ZSH_BIN=$(command -v zsh); then
+  die 'zsh is required to validate the proposed configuration'
+fi
+
+TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mpz-wizard.XXXXXX") || exit 1
+cleanup() { rm -rf -- "$TEMP_DIR"; }
+trap cleanup EXIT INT TERM
+
+has_managed_value() {
+  local index
+  for index in "${!FIELD_KEYS[@]}"; do
+    if [[ -n "${STATE[index]}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The generated file is deterministic: no timestamps, fixed field order, so the
+# same settings always produce identical bytes.
+build_content() {
+  printf '%s\n' \
+    '# Machine-local policy written by scripts/wizard.' \
+    '# Managed file: every apply regenerates it, so hand edits are replaced.' \
+    '# Delete this file to return managed settings to the core defaults.' \
+    ''
+  local index key value
+  for index in "${!FIELD_KEYS[@]}"; do
+    key=${FIELD_KEYS[index]}
+    value=${STATE[index]}
+    [[ -n "$value" ]] || continue
+    field_declaration "$key" "$value"
+  done
+}
+
+display_quote() {
+  local text="$1"
+  text=${text//\\/\\\\}
+  text=${text//\"/\\\"}
+  printf '"%s"' "$text"
+}
+
+print_change_summary() {
+  local index key before after
+  log 'changes:'
+  for index in "${!FIELD_KEYS[@]}"; do
+    key=${FIELD_KEYS[index]}
+    before=$(field_display "$key" "${BASE_STATE[index]}")
+    after=$(field_display "$key" "${STATE[index]}")
+    [[ -n "$before" ]] || before='(none)'
+    [[ -n "$after" ]] || after='(none)'
+    log "$(printf '  %-22s %s -> %s' "$key" "$before" "$after")"
+  done
+}
+
+# Unified before/after diff of the managed file. Lines are shown as quoted
+# literals so leading and trailing whitespace stays visible.
+show_diff() {
+  local -a old=() new=()
+  local line index
+
+  if [[ -r "$MANAGED_FILE" ]]; then
+    while IFS= read -r line; do
+      old+=("$line")
+    done < "$MANAGED_FILE"
+  fi
+  while IFS= read -r line; do
+    new+=("$line")
+  done < <(build_content)
+
+  local old_total=${#old[@]} new_total=${#new[@]}
+  local prefix=0 suffix=0
+
+  while (( prefix < old_total && prefix < new_total )); do
+    if [[ "${old[prefix]}" != "${new[prefix]}" ]]; then
+      break
+    fi
+    prefix=$((prefix + 1))
+  done
+  while (( suffix < old_total - prefix && suffix < new_total - prefix )); do
+    if [[ "${old[old_total - 1 - suffix]}" != "${new[new_total - 1 - suffix]}" ]]; then
+      break
+    fi
+    suffix=$((suffix + 1))
+  done
+
+  local removed=$(( old_total - prefix - suffix ))
+  local added=$(( new_total - prefix - suffix ))
+
+  if (( removed == 0 && added == 0 )); then
+    log 'no changes; the managed file already matches these settings'
+    return 0
+  fi
+
+  local current_label='(no managed file)'
+  if [[ -r "$MANAGED_FILE" ]]; then
+    current_label="$MANAGED_FILE"
+  fi
+
+  local context_start=$(( prefix > 3 ? prefix - 3 : 0 ))
+  local context_end=$(( prefix + removed + 3 ))
+  (( context_end > old_total )) && context_end=$old_total
+  (( context_end < prefix + removed )) && context_end=$((prefix + removed))
+
+  printf -- '--- %s (current)\n' "$current_label"
+  printf -- '+++ %s (proposed)\n' "$MANAGED_FILE"
+  printf -- '@@ -%d,%d +%d,%d @@\n' "$((prefix + 1))" "$removed" "$((prefix + 1))" "$added"
+
+  for (( index = context_start; index < prefix; index++ )); do
+    printf -- '  %s\n' "$(display_quote "${old[index]}")"
+  done
+  for (( index = prefix; index < prefix + removed; index++ )); do
+    printf -- '-%s\n' "$(display_quote "${old[index]}")"
+  done
+  for (( index = prefix; index < prefix + added; index++ )); do
+    printf -- '+%s\n' "$(display_quote "${new[index]}")"
+  done
+  for (( index = prefix + removed; index < context_end; index++ )); do
+    printf -- '  %s\n' "$(display_quote "${old[index]}")"
+  done
+}
+
+show_current() {
+  log "managed file: $MANAGED_FILE"
+  if [[ ! -e "$MANAGED_FILE" ]]; then
+    log 'no managed file yet; every setting uses its core default'
+  fi
+  local index key value display
+  for index in "${!FIELD_KEYS[@]}"; do
+    key=${FIELD_KEYS[index]}
+    value=${STATE[index]}
+    if [[ -n "$value" ]]; then
+      display=$(field_display "$key" "$value")
+    else
+      display='(core default)'
+    fi
+    printf '%s: %-22s %s\n' "$PROGRAM" "$key" "$display"
+  done
+}
+
+run_print() {
+  log 'preview only; no files were changed'
+  log "managed file: $MANAGED_FILE"
+  print_change_summary
+  show_diff
+  log 'run with --apply to write these changes'
+}
+
+# ---------------------------------------------------------------------------
+# Isolated validation
+# ---------------------------------------------------------------------------
+
+PROBE_SCRIPT='
+  print -r -- "HISTSIZE=${HISTSIZE-}"
+  print -r -- "AS=${ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE-}"
+  print -r -- "LEFT=${POWERLEVEL9K_LEFT_PROMPT_ELEMENTS[*]-}"
+  print -r -- "RIGHT=${POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS[*]-}"
+'
+
+expected_probe_lines() {
+  local index key value
+  for index in "${!FIELD_KEYS[@]}"; do
+    key=${FIELD_KEYS[index]}
+    value=${STATE[index]}
+    [[ -n "$value" ]] || continue
+    case "$key" in
+      history_size) printf 'HISTSIZE=%s\n' "$value" ;;
+      autosuggest_highlight) printf 'AS=%s\n' "$value" ;;
+      prompt_left_elements) printf 'LEFT=%s\n' "$value" ;;
+      prompt_right_elements) printf 'RIGHT=%s\n' "$value" ;;
+    esac
+  done
+}
+
+validate_sourceable() {
+  local staged="$1" errors status=0
+
+  errors=$("$ZSH_BIN" -f -c 'source "$1"' zsh "$staged" 2>&1 >/dev/null) || status=$?
+  if (( status != 0 )) || [[ -n "$errors" ]]; then
+    printf '%s: error: the proposed file does not load cleanly in an isolated Zsh; nothing was written\n' \
+      "$PROGRAM" >&2
+    [[ -n "$errors" ]] && printf '%s\n' "$errors" >&2
+    exit 1
+  fi
+}
+
+# Start the real runtime with the candidate installed in an isolated home and
+# verify it starts without failure and keeps every managed value.
+validate_runtime() {
+  local staged="$1"
+  local -a expected=()
+  local line actual_line found status=0 output mismatches='' errors_file
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && expected+=("$line")
+  done < <(expected_probe_lines)
+
+  local home="$TEMP_DIR/home" config="$TEMP_DIR/config" cache="$TEMP_DIR/cache"
+  local state="$TEMP_DIR/state" data="$TEMP_DIR/data" zdotdir="$TEMP_DIR/zdot"
+  mkdir -p "$home" "$config/my-perfect-zsh/local.d" "$cache" "$state" "$data" "$zdotdir"
+  if [[ -n "$staged" ]]; then
+    cp -- "$staged" "$config/my-perfect-zsh/local.d/$MANAGED_NAME" || \
+      die "could not stage the candidate in $config"
+    chmod 600 "$config/my-perfect-zsh/local.d/$MANAGED_NAME"
+  fi
+  ln -s "$ROOT/.zshrc" "$zdotdir/.zshrc" || die "could not link the runtime startup file"
+  ln -s "$ROOT/.zshenv" "$zdotdir/.zshenv" || die "could not link the runtime environment file"
+
+  errors_file="$TEMP_DIR/runtime.stderr"
+  output=$(env HOME="$home" \
+    XDG_CONFIG_HOME="$config" \
+    XDG_CACHE_HOME="$cache" \
+    XDG_STATE_HOME="$state" \
+    XDG_DATA_HOME="$data" \
+    ZDOTDIR="$zdotdir" \
+    "$ZSH_BIN" -lic "$PROBE_SCRIPT" 2>"$errors_file") || status=$?
+
+  if (( status != 0 )); then
+    printf '%s: error: the proposed change failed an isolated Zsh startup; nothing was written\n' \
+      "$PROGRAM" >&2
+    [[ -s "$errors_file" ]] && sed -n '1,20p' "$errors_file" >&2
+    exit 1
+  fi
+
+  local -a actual=()
+  while IFS= read -r line; do
+    actual+=("$line")
+  done <<< "$output"
+
+  for line in "${expected[@]}"; do
+    found=0
+    for actual_line in "${actual[@]}"; do
+      if [[ "$actual_line" == "$line" ]]; then
+        found=1
+        break
+      fi
+    done
+    if (( ! found )); then
+      mismatches+="$line"$'\n'
+    fi
+  done
+
+  if [[ -n "$mismatches" ]]; then
+    printf '%s: error: the proposed change did not survive startup; nothing was written\n' \
+      "$PROGRAM" >&2
+    printf 'settings the isolated runtime did not keep:\n%s' "$mismatches" >&2
+    exit 1
+  fi
+
+  if [[ -s "$errors_file" ]]; then
+    warn 'the isolated startup reported on stderr (reported, not fatal)'
+    sed -n '1,20p' "$errors_file" >&2
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Apply
+# ---------------------------------------------------------------------------
+
+backup_managed() {
+  local backup="$MANAGED_FILE.pre-wizard"
+  if [[ -e "$backup" || -L "$backup" ]]; then
+    backup=$(mktemp "$MANAGED_FILE.pre-wizard.$(date +%Y%m%d-%H%M%S).XXXXXX") || \
+      die "could not create a backup path next to $MANAGED_FILE"
+  fi
+  cp -p -- "$MANAGED_FILE" "$backup" || die "could not back up $MANAGED_FILE"
+  chmod 600 "$backup"
+  log "backed up $MANAGED_FILE to $backup"
+}
+
+publish_file() {
+  local content="$1" temporary
+
+  mkdir -p "$LOCAL_DIR" || die "could not create $LOCAL_DIR"
+  chmod 700 "$LOCAL_DIR"
+
+  temporary=$(mktemp "$LOCAL_DIR/.wizard.XXXXXX") || \
+    die "could not create a temporary file in $LOCAL_DIR"
+  if ! printf '%s\n' "$content" > "$temporary"; then
+    rm -f -- "$temporary"
+    die "could not write the candidate content to $temporary"
+  fi
+  chmod 600 "$temporary"
+  if ! mv -f -- "$temporary" "$MANAGED_FILE"; then
+    rm -f -- "$temporary"
+    die "could not publish $MANAGED_FILE"
+  fi
+  log "wrote $MANAGED_FILE"
+}
+
+run_apply() {
+  log "managed file: $MANAGED_FILE"
+  print_change_summary
+  show_diff
+
+  if ! has_managed_value; then
+    if [[ -e "$MANAGED_FILE" ]]; then
+      validate_runtime ''
+      backup_managed
+      rm -f -- "$MANAGED_FILE"
+      log "removed $MANAGED_FILE; managed settings returned to core defaults"
+    else
+      log 'nothing to apply; no managed settings were requested'
+    fi
+    return 0
+  fi
+
+  local staged="$TEMP_DIR/candidate.zsh" content
+  content=$(build_content)
+  printf '%s\n' "$content" > "$staged"
+  chmod 600 "$staged"
+
+  validate_sourceable "$staged"
+  validate_runtime "$staged"
+
+  if [[ -e "$MANAGED_FILE" ]] && cmp -s -- "$staged" "$MANAGED_FILE"; then
+    log 'the managed file already matches these settings; nothing was written'
+    return 0
+  fi
+  if [[ -e "$MANAGED_FILE" ]]; then
+    backup_managed
+  fi
+
+  publish_file "$content"
+}
+
+# ---------------------------------------------------------------------------
+# Interactive wizard
+# ---------------------------------------------------------------------------
+#
+# The menu reads one keypress at a time. Escape sequences cover the arrow keys;
+# j/k, digits, and Enter work everywhere. Because the loop only needs readable
+# input, a scripted session works too, which is how the tests drive it.
+
+tui_menu() {
+  local selected="$1" index key value marker display
+
+  if [[ -t 1 ]]; then
+    printf '\033[2J\033[H'
+  fi
+  printf '%s: machine-local configuration wizard\n' "$PROGRAM"
+  printf 'file: %s\n\n' "$MANAGED_FILE"
+  for index in "${!FIELD_KEYS[@]}"; do
+    key=${FIELD_KEYS[index]}
+    value=${STATE[index]}
+    marker='  '
+    if (( index == selected )); then
+      marker='> '
+    fi
+    if [[ -n "$value" ]]; then
+      display=$(field_display "$key" "$value")
+    else
+      display='(core default)'
+    fi
+    printf '%s%d. %-22s %s\n' "$marker" "$((index + 1))" "$key" "$display"
+  done
+  printf '\n'
+  printf 'j/k or arrows move  Enter or 1-%d edit  x clear  p preview  a apply  ? help  q quit\n' \
+    "${#FIELD_KEYS[@]}"
+}
+
+tui_pause() {
+  [[ -t 0 ]] || return 0
+  printf '\n%s: press any key to continue' "$PROGRAM"
+  IFS= read -rsn1 _
+  printf '\n'
+}
+
+tui_help() {
+  printf '\n%s: keys\n' "$PROGRAM"
+  printf '  j / Down      move to the next setting\n'
+  printf '  k / Up        move to the previous setting\n'
+  printf '  1..%d         jump to a setting\n' "${#FIELD_KEYS[@]}"
+  printf '  Enter         edit the selected setting\n'
+  printf '  x             clear the selected setting (core default)\n'
+  printf '  p             preview the proposed file\n'
+  printf '  a             apply (writes after isolated validation)\n'
+  printf '  ?             show this help\n'
+  printf '  q / Esc       quit\n'
+  tui_pause
+}
+
+# Editing keeps the current value when the input is empty, so a mis-pressed
+# Enter cannot clear a setting.
+tui_edit() {
+  local index="$1" key value current input='' normalized
+  key=${FIELD_KEYS[index]}
+  value=${STATE[index]}
+  current=$(field_display "$key" "$value")
+
+  if [[ -t 0 ]]; then
+    IFS= read -re -i "$current" -p "  $key> " input || {
+      warn "edit of $key cancelled"
+      return 0
+    }
+  else
+    printf '  %s [%s]> ' "$key" "$current"
+    IFS= read -r input || {
+      warn "edit of $key cancelled"
+      return 0
+    }
+  fi
+
+  if [[ -z "$input" ]]; then
+    warn "kept the current value for $key"
+    return 0
+  fi
+
+  normalized=$(field_normalize "$key" "$input") || {
+    warn "$normalized"
+    tui_pause
+    return 0
+  }
+  STATE[index]="$normalized"
+  log "staged $key=$(field_display "$key" "$normalized")"
+}
+
+tui_preview() {
+  log 'preview only; no files were changed'
+  log "managed file: $MANAGED_FILE"
+  print_change_summary
+  show_diff
+  tui_pause
+}
+
+tui_apply() {
+  run_apply
+  load_state
+  BASE_STATE=("${STATE[@]}")
+  tui_pause
+}
+
+# Reads one keypress into TUI_KEY. On a terminal each keypress is read on its
+# own, so arrow keys work without Enter. Piped input arrives newline-terminated,
+# so each line is one key (an empty line is Enter) and an escape sequence is
+# kept whole; that keeps a scripted session deterministic.
+tui_read_key() {
+  local line=''
+
+  TUI_KEY=''
+  if [[ -t 0 ]]; then
+    IFS= read -rsn1 TUI_KEY || return 1
+    if [[ "$TUI_KEY" == $'\e' ]]; then
+      local rest=''
+      IFS= read -rsn2 -t 0.05 rest || true
+      TUI_KEY+="$rest"
+    fi
+    return 0
+  fi
+
+  IFS= read -r line || return 1
+  if [[ "$line" == $'\e'* ]]; then
+    TUI_KEY="$line"
+  else
+    TUI_KEY=${line:0:1}
+  fi
+  return 0
+}
+
+wizard_tui() {
+  local selected=0 total=${#FIELD_KEYS[@]} index
+  local key=''
+
+  while :; do
+    tui_menu "$selected"
+    tui_read_key || break
+    key="$TUI_KEY"
+    case "$key" in
+      $'\e[A' | $'\eOA') selected=$(((selected + total - 1) % total)) ;;
+      $'\e[B' | $'\eOB') selected=$(((selected + 1) % total)) ;;
+      $'\e') break ;;
+      k) selected=$(((selected + total - 1) % total)) ;;
+      j) selected=$(((selected + 1) % total)) ;;
+      '') tui_edit "$selected" ;;
+      p | P) tui_preview ;;
+      a | A) tui_apply ;;
+      x | X)
+        STATE[selected]=''
+        log "cleared ${FIELD_KEYS[selected]}; the core default applies"
+        ;;
+      '?' | h | H) tui_help ;;
+      q | Q | $'\003') break ;;
+      [0-9])
+        index=$((10#$key))
+        if (( index >= 1 && index <= total )); then
+          selected=$((index - 1))
+        fi
+        ;;
+      *) : ;;
+    esac
+  done
+  log 'done'
+}
+
+resolve_config_dir
+preflight
+load_state
+BASE_STATE=("${STATE[@]}")
+apply_requests
+
+case "$MODE" in
+  show) show_current ;;
+  print) run_print ;;
+  apply) run_apply ;;
+  tui) wizard_tui ;;
+  *) usage_error "unknown mode: $MODE" ;;
+esac

@@ -27,7 +27,7 @@ interface callers need to know.
 |---|---|---|
 | Bootstrap | Repository and XDG paths become available | PATH idempotence, secure directory creation, Atuin config selection |
 | Options | Curated interactive behavior | Option conflicts and defaults |
-| Local | Machine policy is loaded | Ordered files, quiet stdout, user/canonical paths |
+| Local | Machine policy is loaded | Ordered files, quiet stdout, override capture and re-application |
 | History | `HISTFILE`, bounded size, private policy | Duplicate and leading-space handling |
 | Completion | Completion is initialized once | Styles, cache, fzf-tab order, deferred Bun |
 | Navigation | `z`, `zi`, `Ctrl-T`, `Alt-C` | zoxide initialization, fzf fallback widgets |
@@ -67,6 +67,9 @@ Important ordering constraints:
 
 - local configuration runs before integrations so it can adjust PATH and the
   Atuin configuration directory;
+- core modules reset the parameters they own and then re-apply the machine-local
+  declaration, so a local file wins over a core default without being sourced
+  twice;
 - `compinit` runs before fzf-tab and deferred Bun completion;
 - fzf-tab runs before autosuggestions and highlighting;
 - Atuin initializes in the parent shell before autosuggestions;
@@ -192,6 +195,36 @@ configuration comments are preserved while the exact `^\s+` filter is enforced.
 
 Legacy Zsh history is appended once. A marker in the state directory prevents
 repeated concatenation.
+
+## Configuration wizard
+
+`scripts/wizard` edits machine-local policy only. It writes one managed file,
+`<config dir>/local.d/50-wizard.zsh`, and never changes published core files or
+startup files. Preview is the default; `--apply` is required before anything is
+written, so every change is reviewed before it lands.
+
+Four settings are managed: history size (`HISTSIZE`), the autosuggestion
+highlight style (`ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE`), and the left and right
+Powerlevel10k prompt element lists. Values are validated before any write: a
+history size must be a positive integer inside a fixed bound, a highlight style
+must be a literal that stays safe inside the generated double quotes, and prompt
+elements must be Powerlevel10k names.
+
+The proposed file is staged and validated in an isolated Zsh before publication.
+Sourcing must be silent, and the real runtime must start from an isolated HOME
+and XDG tree with every managed value still in place. A candidate that fails
+either check leaves the active file untouched. An existing managed file is
+copied to a timestamped backup before replacement, and the write itself is
+atomic, so an interrupted run cannot leave a partial file.
+
+The generated file is deterministic: fixed header, fixed field order, no
+timestamps. Applying the same settings twice writes nothing the second time, so
+a preview is a byte-exact statement of what `--apply` will do.
+
+`--tui` opens an interactive menu over the same settings. It reads one keypress
+at a time on a terminal and one key per line when piped, so a scripted session
+and the automated tests drive the same interface. Nothing in the wizard runs at
+startup.
 
 ## Evolution rules
 

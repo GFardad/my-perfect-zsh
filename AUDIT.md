@@ -103,13 +103,19 @@ modules/syntax.zsh            fast-syntax-highlighting, sourced last
 config/p10k.zsh               compact prompt policy
 config/atuin/config.toml      privacy-safe defaults
 deps.lock                     exact source and tool versions
-scripts/                      install, rollback, history import, benchmark
-tests/                        smoke, PTY, and performance checks
+scripts/                      install, rollback, history import, wizard, benchmark
+tests/                        smoke, PTY, wizard, and performance checks
 ```
 
 The explicit source list is the interface. Each module owns one concern,
 optional dependencies fail closed, and the final keymap is the single
 enforcement point.
+
+Machine-local values survive the core baseline: `modules/local.zsh` records the
+declarations local files make for the parameters the core owns, and each core
+module re-applies its own declaration after setting the default. This is what
+makes `scripts/wizard` effective, because history size and the autosuggestion
+style would otherwise be reset by the modules that publish the defaults.
 
 ## Explicit key ownership
 
@@ -161,10 +167,10 @@ Measured in an isolated HOME/XDG environment with real login-interactive Zsh:
 
 | Measurement | Original | Implemented | Budget |
 |---|---:|---:|---:|
-| Cold startup | 100.503 s | 223 ms | 300 ms |
-| Warm p50 | 100.503 s | 49 ms | 60 ms |
-| Warm p95 | 100.503 s | 53 ms | 80 ms |
-| Warm max | 100.503 s | 56 ms across 30 samples | 80 ms |
+| Cold startup | 100.503 s | 224 ms | 300 ms |
+| Warm p50 | 100.503 s | 50 ms | 60 ms |
+| Warm p95 | 100.503 s | 59 ms | 80 ms |
+| Warm max | 100.503 s | 63 ms across 30 samples | 80 ms |
 
 The cold sample includes completion cache creation. Warm samples use the cache.
 The test suite also proves that fetch, fastfetch, Bun, Python, fzf, thefuck,

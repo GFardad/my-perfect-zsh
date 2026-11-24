@@ -36,6 +36,7 @@ scripts/
   install                     deterministic installer and atomic linker
   uninstall                   rollback
   import-history              one-time legacy history import
+  wizard                      machine-local settings wizard (preview before apply)
   benchmark.sh                performance interface
   check-syntax.sh             zsh -n interface
 lib/
@@ -44,6 +45,7 @@ tests/
   smoke.zsh                   interface and fallback checks
   pty_smoke.py                PTY-backed ZLE and history checks
   perf.zsh                    cold/warm benchmark
+  wizard.zsh                  wizard validation and isolation checks
   run                         complete verification interface
 vendor/                       ignored; exact dependency checkouts
 ```

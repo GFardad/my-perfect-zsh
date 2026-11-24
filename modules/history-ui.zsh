@@ -26,4 +26,6 @@ if [[ -r "$MPZ_VENDOR_DIR/zsh-autosuggestions/zsh-autosuggestions.zsh" ]]; then
   source "$MPZ_VENDOR_DIR/zsh-autosuggestions/zsh-autosuggestions.zsh"
   ZSH_AUTOSUGGEST_STRATEGY=(history)
   typeset -g ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=8'
+  # A machine-local highlight style wins over the core default.
+  _mpz_reapply_local_override ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE
 fi

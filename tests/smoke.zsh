@@ -444,6 +444,34 @@ assert_contains "$HISTORY_HOOK_RESULT" 'defined=1' \
 assert_contains "$HISTORY_HOOK_RESULT" 'registered=_mpz_zshaddhistory' \
   'Zsh history hook remains registered after startup'
 
+# The machine-local seam must let local values win without weakening the core
+# baseline, and the core baseline must apply when nothing local sets a value.
+# Zsh defines a default HISTSIZE before startup files run, so a parameter that
+# exists without a local file is not an override.
+LOCAL_OVERRIDE_CONFIG="$TEMP_ROOT/override-config"
+mkdir -p "$LOCAL_OVERRIDE_CONFIG/my-perfect-zsh/local.d"
+run_override_shell() {
+  HOME="$TEMP_ROOT/home" \
+  XDG_CONFIG_HOME="$LOCAL_OVERRIDE_CONFIG" \
+  XDG_CACHE_HOME="$TEMP_ROOT/cache" \
+  XDG_STATE_HOME="$TEMP_ROOT/state" \
+  XDG_DATA_HOME="$TEMP_ROOT/data" \
+  ATUIN_HOME="$TEMP_ROOT/atuin-home" \
+  ATUIN_CONFIG_DIR="$TEMP_ROOT/config/atuin" \
+  ZDOTDIR="$TEMP_ROOT/zdot" \
+  command /usr/bin/zsh -lic "$1"
+}
+CORE_HISTORY=$(run_override_shell 'print -r -- "$HISTSIZE|$SAVEHIST|${ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE-unset}"' 2>/dev/null)
+assert_eq '50000|50000|fg=8' "$CORE_HISTORY" \
+  'core history and autosuggestion defaults apply without local overrides'
+cat > "$LOCAL_OVERRIDE_CONFIG/my-perfect-zsh/local.d/60-override.zsh" <<'EOF'
+typeset -g HISTSIZE=4321
+typeset -g ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=110,bold'
+EOF
+OVERRIDDEN_HISTORY=$(run_override_shell 'print -r -- "$HISTSIZE|$SAVEHIST|$ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE"' 2>/dev/null)
+assert_eq '4321|50000|fg=110,bold' "$OVERRIDDEN_HISTORY" \
+  'machine-local history size and autosuggestion style win over the core baseline'
+
 # The published runtime contains no machine-specific policy.
 MACHINE_MATCHES=''
 for runtime_file in \
@@ -472,6 +500,57 @@ else
   fail 'vendored dependencies match deps.lock'
   sed -n '1,120p' "$TEMP_ROOT/install-check.out" >&2
 fi
+
+# The on-demand wizard writes machine-local configuration only.
+WIZARD_CONFIG="$TEMP_ROOT/wizard-config/my-perfect-zsh"
+CORE_FILES=("$ROOT/.zshrc" "$ROOT/.zshenv" "$ROOT"/modules/*.zsh "$ROOT"/config/*.zsh)
+CORE_BEFORE=$(sha256sum "${CORE_FILES[@]}" 2>/dev/null | sha256sum | cut -d' ' -f1)
+
+WIZARD_HELP=$("$ROOT/scripts/wizard" --help 2>&1)
+assert_eq 0 "$?" 'wizard help exits successfully'
+assert_contains "$WIZARD_HELP" '--set S=V' 'wizard documents its settings interface'
+
+WIZARD_SHOW=$(HOME="$TEMP_ROOT/home" \
+  "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --show 2>&1)
+assert_eq 0 "$?" 'wizard reports an unmanaged machine-local configuration'
+assert_contains "$WIZARD_SHOW" 'no managed file yet' 'wizard reports core defaults when nothing is managed'
+
+WIZARD_PREVIEW=$(HOME="$TEMP_ROOT/home" \
+  "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --print --set history_size=99 2>&1)
+assert_eq 0 "$?" 'wizard preview succeeds'
+assert_contains "$WIZARD_PREVIEW" 'typeset -g HISTSIZE=99"' 'wizard preview shows the proposed change'
+if [[ ! -e "$WIZARD_CONFIG/local.d/50-wizard.zsh" ]]; then
+  pass 'wizard preview writes nothing'
+else
+  fail 'wizard preview writes nothing'
+fi
+
+assert_eq 2 "$("$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --set bogus=1 --apply >/dev/null 2>&1; print $?)" \
+  'wizard rejects an unknown setting'
+assert_eq 1 "$(HOME="$TEMP_ROOT/home" "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --apply --set history_size=nope >/dev/null 2>&1; print $?)" \
+  'wizard rejects an invalid value'
+
+WIZARD_APPLY=$(HOME="$TEMP_ROOT/home" \
+  "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --apply \
+  --set prompt_right_elements=status,time 2>&1)
+assert_eq 0 "$?" 'wizard applies a machine-local change'
+assert_contains "$WIZARD_APPLY" 'wizard: wrote' 'wizard reports the managed file location'
+assert_eq 600 "$(stat -c '%a' "$WIZARD_CONFIG/local.d/50-wizard.zsh")" 'wizard file has mode 600'
+assert_contains "$(<"$WIZARD_CONFIG/local.d/50-wizard.zsh")" \
+  'typeset -g POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(status time)' \
+  'wizard file carries the chosen value'
+
+WIZARD_TUI=$(printf '3\n\nstatus,time\na\nq\n' | \
+  HOME="$TEMP_ROOT/home" "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --tui 2>&1)
+assert_eq 0 "$?" 'wizard interactive session succeeds'
+assert_contains "$WIZARD_TUI" 'wizard: wrote' 'wizard interactive session applies the staged change'
+WIZARD_SHOW_AFTER=$(HOME="$TEMP_ROOT/home" \
+  "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --show 2>&1)
+assert_contains "$WIZARD_SHOW_AFTER" 'prompt_left_elements' 'wizard interactive change is reported'
+assert_contains "$WIZARD_SHOW_AFTER" 'status,time' 'wizard interactive change keeps the chosen value'
+
+CORE_AFTER=$(sha256sum "${CORE_FILES[@]}" 2>/dev/null | sha256sum | cut -d' ' -f1)
+assert_eq "$CORE_BEFORE" "$CORE_AFTER" 'wizard does not modify published runtime files'
 
 print -r -- "smoke: ${PASSED} passed, ${FAILED} failed"
 (( FAILED == 0 ))

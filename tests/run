@@ -26,6 +26,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/scripts/install" \
     "$ROOT/scripts/uninstall" \
     "$ROOT/scripts/import-history" \
+    "$ROOT/scripts/wizard" \
     "$ROOT/scripts/benchmark.sh" \
     "$ROOT/scripts/check-syntax.sh" \
     "$ROOT/tests/run"
@@ -44,6 +45,7 @@ fi
 "$ROOT/tests/installer.zsh"
 "$ROOT/tests/history.zsh"
 "$ROOT/tests/extract.zsh"
+"$ROOT/tests/wizard.zsh"
 python3 -m py_compile "$ROOT/tests/pty_smoke.py"
 rm -rf "$ROOT/tests/__pycache__"
 python3 "$ROOT/tests/pty_smoke.py"

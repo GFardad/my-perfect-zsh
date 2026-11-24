@@ -4,6 +4,10 @@ typeset -g HISTFILE="$XDG_STATE_HOME/zsh/history"
 typeset -g HISTSIZE=50000
 typeset -g SAVEHIST=50000
 
+# A machine-local history size wins over the core bound; the bounded-history
+# policy itself stays with the core.
+_mpz_reapply_local_override HISTSIZE
+
 setopt APPEND_HISTORY
 setopt HIST_EXPIRE_DUPS_FIRST
 setopt HIST_FIND_NO_DUPS

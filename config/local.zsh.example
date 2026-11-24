@@ -19,3 +19,12 @@
 # if (( $+commands[bat] )); then
 #   export FZF_DEFAULT_OPTS="--preview 'bat --style=numbers --color=always --line-range :500 {}'"
 # fi
+
+# scripts/wizard writes ~/.config/my-perfect-zsh/local.d/50-wizard.zsh for four
+# settings. The core module that owns each default re-applies the machine-local
+# declaration after its own baseline, so these win over the published values:
+#
+#   history_size            HISTSIZE
+#   autosuggest_highlight   ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE
+#   prompt_left_elements    POWERLEVEL9K_LEFT_PROMPT_ELEMENTS
+#   prompt_right_elements   POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS

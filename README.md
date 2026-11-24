@@ -90,8 +90,8 @@ modules/syntax.zsh            fast-syntax-highlighting, sourced last
 config/p10k.zsh               compact prompt policy
 config/atuin/config.toml      privacy-safe defaults
 deps.lock                     exact source and tool versions
-scripts/                      install, rollback, history import, benchmark
-tests/                        smoke, PTY, and performance checks
+scripts/                      install, rollback, history import, wizard, benchmark
+tests/                        smoke, PTY, wizard, and performance checks
 ```
 
 The explicit source list is the interface. Each module owns one concern and
@@ -111,6 +111,26 @@ corrupt Powerlevel10k's instant prompt. The final reserved keymap is applied
 after local files, preventing them from stealing owned keys.
 
 See `config/local.zsh.example` for the interface.
+
+### Configuration wizard
+
+`scripts/wizard` customizes four machine-local settings without hand-editing
+files:
+
+```sh
+./scripts/wizard --show                                    # current settings
+./scripts/wizard --set history_size=20000 --print          # preview, changes nothing
+./scripts/wizard --set prompt_right_elements=status,time --apply
+./scripts/wizard --tui                                    # interactive menu
+```
+
+It writes only `<config dir>/local.d/50-wizard.zsh` (mode `600`). Preview is the
+default, so a change is always shown before it is applied, and the preview is a
+byte-exact unified diff of the file `--apply` will write. Every value is
+validated first, and the candidate is loaded in an isolated Zsh and started in
+an isolated HOME/XDG tree before it replaces the active file; the existing file
+is backed up first. The generated file is deterministic, so applying the same
+settings twice is a no-op. Nothing in the wizard runs at startup.
 
 ## Privacy and security
 
@@ -143,15 +163,16 @@ The benchmark uses isolated XDG directories and a real login-interactive Zsh:
 ./scripts/benchmark.sh 30
 ```
 
-Measured on 2026-11-22 in the audit environment:
+Measured on 2026-11-25 in the audit environment, 30 warm samples:
 
 ```text
-cold:     246 ms   (budget 300 ms)
-warm p50:  37 ms   (budget  60 ms)
-warm p95:  40 ms   (budget  80 ms)
+cold:     224 ms   (budget 300 ms)
+warm p50:  50 ms   (budget  60 ms)
+warm p95:  59 ms   (budget  80 ms)
+warm max:  63 ms
 ```
 
-Results vary by machine. The benchmark fails when a budget is exceeded.
+Results vary by machine and load. The benchmark fails when a budget is exceeded.
 
 ## Development
 
@@ -165,7 +186,8 @@ Results vary by machine. The benchmark fails when a budget is exceeded.
 The test suite proves startup silence, no forbidden startup processes, reserved
 key ownership in all supported keymaps, optional-tool fallback, retryable lazy
 parent-shell initialization, leading-whitespace and multiline history privacy,
-installer validation and rollback, and PTY-backed ZLE dispatch behavior.
+installer validation and rollback, wizard validation, preview isolation, and
+PTY-backed ZLE dispatch behavior.
 
 ## Rollback
 
