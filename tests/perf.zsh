@@ -5,15 +5,67 @@ set -u
 zmodload zsh/datetime
 
 ROOT=${0:A:h:h}
-ITERATIONS=${1:-30}
 WARMUPS=${MPZ_BENCH_WARMUPS:-3}
 COLD_BUDGET_MS=${MPZ_COLD_BUDGET_MS:-300}
 P50_BUDGET_MS=${MPZ_P50_BUDGET_MS:-60}
 P95_BUDGET_MS=${MPZ_P95_BUDGET_MS:-80}
 
+IGNORE_LOAD=0
+while (($#)); do
+  case "$1" in
+    --ignore-load)
+      IGNORE_LOAD=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+ITERATIONS=${1:-30}
+
 if [[ "$ITERATIONS" != <-> ]] || (( ITERATIONS < 5 )); then
   print -u2 -- 'perf: iterations must be an integer of at least 5'
   exit 2
+fi
+
+# A startup budget is only evidence when the machine is quiet enough for the
+# sample to describe the configuration rather than competing load. A loaded
+# machine produces numbers that look like a regression, so the measurement is
+# refused instead of reported, and the load is printed alongside any result.
+typeset -g LOAD1='' LOAD_CORES=0
+load_snapshot() {
+  local line cores
+  line=$(</proc/loadavg 2>/dev/null) || return 1
+  cores=$(command nproc 2>/dev/null) || cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null) || return 1
+  [[ "$line" == *' '* && "$cores" == <-> ]] || return 1
+  (( cores >= 1 )) || return 1
+  LOAD1=${line%% *}
+  LOAD_CORES=$cores
+  return 0
+}
+
+if load_snapshot; then
+  # zsh compares decimal load averages with <-> only for integers, so the
+  # comparison is done in awk with an exact threshold.
+  refuse_after=$(awk -v cores="$LOAD_CORES" -v factor="${MPZ_LOAD_REFUSE_FACTOR:-2}" \
+    'BEGIN { printf "%.1f", cores * factor }')
+  warn_after=$(awk -v cores="$LOAD_CORES" -v factor="${MPZ_LOAD_WARN_FACTOR:-1}" \
+    'BEGIN { printf "%.1f", cores * factor }')
+  if awk -v avg="$LOAD1" -v limit="$refuse_after" 'BEGIN { exit !(avg > limit) }'; then
+    if (( IGNORE_LOAD )); then
+      print -u2 -- "perf: warning: load ${LOAD1} exceeds ${refuse_after}; continuing because --ignore-load was given"
+    else
+      print -u2 -- "perf: refusing to measure: load ${LOAD1} exceeds ${refuse_after} (${LOAD_CORES} cores)"
+      print -u2 -- 'perf: a loaded machine measures contention, not startup. Retry when idle, or use'
+      print -u2 -- 'perf: --ignore-load to force, or set MPZ_LOAD_REFUSE_FACTOR to change the limit.'
+      exit 1
+    fi
+  elif awk -v avg="$LOAD1" -v limit="$warn_after" 'BEGIN { exit !(avg > limit) }'; then
+    print -u2 -- "perf: note: load ${LOAD1} is above ${warn_after}; numbers include some contention"
+  fi
+else
+  print -u2 -- 'perf: note: load average unavailable; numbers cannot be qualified'
 fi
 
 TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/mpz-benchmark.XXXXXX") || exit 1

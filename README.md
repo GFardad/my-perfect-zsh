@@ -132,6 +132,12 @@ an isolated HOME/XDG tree before it replaces the active file; the existing file
 is backed up first. The generated file is deterministic, so applying the same
 settings twice is a no-op. Nothing in the wizard runs at startup.
 
+The interactive menu shows a one-line description for every setting, moves with
+the arrow keys or `j`/`k`, edits with `Enter` (the prompt is pre-filled with the
+current value), clears a setting with `x`, previews with `p`, and asks for
+confirmation before writing. Colour is used only when stdout is a terminal, so
+piped and scripted output stays plain text.
+
 ## Privacy and security
 
 - `compaudit` remains enabled; completion runs exactly once.
@@ -163,7 +169,7 @@ The benchmark uses isolated XDG directories and a real login-interactive Zsh:
 ./scripts/benchmark.sh 30
 ```
 
-Measured on 2026-11-25 in the audit environment, 30 warm samples:
+Measured on 2026-11-25 on an idle machine, 30 warm samples:
 
 ```text
 cold:     224 ms   (budget 300 ms)
@@ -172,7 +178,11 @@ warm p95:  59 ms   (budget  80 ms)
 warm max:  63 ms
 ```
 
-Results vary by machine and load. The benchmark fails when a budget is exceeded.
+A loaded machine measures contention, not startup, so the benchmark refuses to
+report when the one-minute load average exceeds twice the CPU count, and it
+prints a note when the load exceeds the core count. `--ignore-load` forces a
+measurement anyway, and `MPZ_LOAD_REFUSE_FACTOR` / `MPZ_LOAD_WARN_FACTOR` change
+the limits. Any measured run also prints the load that produced the numbers.
 
 ## Development
 

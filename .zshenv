@@ -5,5 +5,10 @@
 if [[ -o interactive ]]; then
   unsetopt GLOBAL_RCS
 fi
-# browse: ensure ~/.local/bin is on PATH in zsh
-export PATH="$HOME/.local/bin:$PATH"
+# browse: ensure ~/.local/bin is on PATH in zsh.
+# .zshenv runs for every shell, including nested non-interactive ones, so the
+# prepend must be idempotent or PATH grows once per nesting level.
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac

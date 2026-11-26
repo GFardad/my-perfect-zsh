@@ -61,11 +61,21 @@ Options:
   --unset S      drop one managed setting (repeatable)
   -h, --help     show this help
 
-Managed settings:
-  history_size            HISTSIZE, 1..1000000
-  autosuggest_highlight   ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE, empty clears
-  prompt_left_elements    POWERLEVEL9K_LEFT_PROMPT_ELEMENTS, comma-separated
-  prompt_right_elements   POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS, comma-separated
+EOF
+  # The settings block is generated from the same registry the wizard enforces,
+  # so the help text can never describe a setting that no longer exists.
+  printf 'Managed settings (name: parameter, what it changes):\n'
+  local key parameter description
+  for key in "${FIELD_KEYS[@]}"; do
+    parameter=$(field_parameter "$key")
+    description=$(field_description "$key")
+    printf '  %-22s %s, %s\n' "$key" "$parameter" "$description"
+  done
+  cat <<'EOF'
+
+Every setting also accepts an empty value, which clears it and restores the core
+default. history_size accepts a positive integer up to 1000000, and the prompt
+element lists accept comma-separated Powerlevel10k element names.
 
 Examples:
   scripts/wizard --show
@@ -94,6 +104,18 @@ field_parameter() {
     autosuggest_highlight) printf 'ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE\n' ;;
     prompt_left_elements) printf 'POWERLEVEL9K_LEFT_PROMPT_ELEMENTS\n' ;;
     prompt_right_elements) printf 'POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# One line of help per managed setting. A single definition is reused by --help
+# and the interactive menu, so the two surfaces cannot drift apart.
+field_description() {
+  case "$1" in
+    history_size) printf 'how many commands Zsh keeps in memory\n' ;;
+    autosuggest_highlight) printf 'colour of the inline suggestion\n' ;;
+    prompt_left_elements) printf 'segments on the left of the prompt\n' ;;
+    prompt_right_elements) printf 'segments on the right of the prompt\n' ;;
     *) return 1 ;;
   esac
 }
@@ -749,27 +771,45 @@ run_apply() {
 # j/k, digits, and Enter work everywhere. Because the loop only needs readable
 # input, a scripted session works too, which is how the tests drive it.
 
+# Colour is used only when stdout is a terminal. Scripted sessions, pipes, and
+# tests therefore keep receiving plain text, so no output has to be stripped.
+tui_color() {
+  [[ -t 1 ]] || return 0
+  case "$1" in
+    reset) printf '\033[0m' ;;
+    bold) printf '\033[1m' ;;
+    cyan) printf '\033[36m' ;;
+  esac
+}
+
 tui_menu() {
   local selected="$1" index key value marker display
+  local bold accent reset
+
+  bold=$(tui_color bold)
+  accent=$(tui_color cyan)
+  reset=$(tui_color reset)
 
   if [[ -t 1 ]]; then
     printf '\033[2J\033[H'
   fi
-  printf '%s: machine-local configuration wizard\n' "$PROGRAM"
+  printf '%s%s: machine-local configuration wizard%s\n' "$bold" "$PROGRAM" "$reset"
   printf 'file: %s\n\n' "$MANAGED_FILE"
   for index in "${!FIELD_KEYS[@]}"; do
     key=${FIELD_KEYS[index]}
     value=${STATE[index]}
-    marker='  '
     if (( index == selected )); then
-      marker='> '
+      marker="${accent}> ${reset}"
+    else
+      marker='  '
     fi
     if [[ -n "$value" ]]; then
       display=$(field_display "$key" "$value")
     else
       display='(core default)'
     fi
-    printf '%s%d. %-22s %s\n' "$marker" "$((index + 1))" "$key" "$display"
+    printf '%s%d. %s%-22s%s %s\n' "$marker" "$((index + 1))" "$bold" "$key" "$reset" "$display"
+    printf '     %s\n' "$(field_description "$key")"
   done
   printf '\n'
   printf 'j/k or arrows move  Enter or 1-%d edit  x clear  p preview  a apply  ? help  q quit\n' \
@@ -791,7 +831,7 @@ tui_help() {
   printf '  Enter         edit the selected setting\n'
   printf '  x             clear the selected setting (core default)\n'
   printf '  p             preview the proposed file\n'
-  printf '  a             apply (writes after isolated validation)\n'
+  printf '  a             apply (asks for confirmation, then validates and writes)\n'
   printf '  ?             show this help\n'
   printf '  q / Esc       quit\n'
   tui_pause
@@ -840,7 +880,25 @@ tui_preview() {
   tui_pause
 }
 
+# Writing is confirmed even inside the menu: a single stray keypress must not
+# change the live configuration. The default answer (empty input) cancels, and a
+# scripted session answers with its next line, so automation stays explicit.
+tui_confirm_apply() {
+  local answer=''
+
+  printf 'write %s (the previous file is backed up first)? [y/N] ' "$MANAGED_FILE"
+  IFS= read -r answer || return 1
+  case "$answer" in
+    y | Y | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 tui_apply() {
+  if ! tui_confirm_apply; then
+    log 'cancelled; nothing was written'
+    return 0
+  fi
   run_apply
   load_state
   BASE_STATE=("${STATE[@]}")

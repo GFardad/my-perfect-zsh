@@ -540,14 +540,37 @@ assert_contains "$(<"$WIZARD_CONFIG/local.d/50-wizard.zsh")" \
   'typeset -g POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(status time)' \
   'wizard file carries the chosen value'
 
-WIZARD_TUI=$(printf '3\n\nstatus,time\na\nq\n' | \
+WIZARD_TUI=$(printf '3\n\nstatus,time\na\ny\nq\n' | \
   HOME="$TEMP_ROOT/home" "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --tui 2>&1)
 assert_eq 0 "$?" 'wizard interactive session succeeds'
+assert_contains "$WIZARD_TUI" 'write ' 'wizard interactive session confirms before writing'
 assert_contains "$WIZARD_TUI" 'wizard: wrote' 'wizard interactive session applies the staged change'
 WIZARD_SHOW_AFTER=$(HOME="$TEMP_ROOT/home" \
   "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --show 2>&1)
 assert_contains "$WIZARD_SHOW_AFTER" 'prompt_left_elements' 'wizard interactive change is reported'
 assert_contains "$WIZARD_SHOW_AFTER" 'status,time' 'wizard interactive change keeps the chosen value'
+
+# The menu shows a one-line description for every managed setting, and the
+# description also appears in the help text.
+assert_contains "$WIZARD_TUI" 'segments on the left of the prompt' \
+  'wizard menu describes each managed setting'
+assert_contains "$WIZARD_HELP" 'how many commands Zsh keeps in memory' \
+  'wizard help describes each managed setting'
+
+# Declining the confirmation writes nothing, including the first apply.
+WIZARD_CANCEL=$(printf '1\n\n777\na\n\nq\n' | \
+  HOME="$TEMP_ROOT/home" "$ROOT/scripts/wizard" --config "$WIZARD_CONFIG" --tui 2>&1)
+assert_contains "$WIZARD_CANCEL" 'wizard: cancelled; nothing was written' \
+  'wizard interactive session cancels a declined confirmation'
+WIZARD_CANCEL_CONFIG="$TEMP_ROOT/wizard-cancel-config"
+WIZARD_CANCEL_OUT=$(printf '1\n\n777\na\n\nq\n' | \
+  HOME="$TEMP_ROOT/home" "$ROOT/scripts/wizard" --config "$WIZARD_CANCEL_CONFIG" --tui 2>&1)
+assert_eq 0 "$?" 'wizard declined confirmation succeeds'
+if [[ -e "$WIZARD_CANCEL_CONFIG/local.d/50-wizard.zsh" ]]; then
+  fail 'wizard declined confirmation writes no managed file'
+else
+  pass 'wizard declined confirmation writes no managed file'
+fi
 
 CORE_AFTER=$(sha256sum "${CORE_FILES[@]}" 2>/dev/null | sha256sum | cut -d' ' -f1)
 assert_eq "$CORE_BEFORE" "$CORE_AFTER" 'wizard does not modify published runtime files'

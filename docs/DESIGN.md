@@ -177,6 +177,11 @@ fails against these budgets:
 | Warm p50 | 60 ms |
 | Warm p95 | 80 ms |
 
+A measurement is only evidence on a quiet machine. The benchmark reads
+`/proc/loadavg` and the CPU count, refuses to report when the one-minute load
+exceeds twice the cores, notes when it exceeds the cores, and always prints the
+load that produced the numbers. `--ignore-load` forces a run.
+
 A startup shim suite additionally proves that fetch, fastfetch, Bun, Python,
 fzf, thefuck, curl, and wget are not executed during startup.
 
@@ -223,8 +228,10 @@ a preview is a byte-exact statement of what `--apply` will do.
 
 `--tui` opens an interactive menu over the same settings. It reads one keypress
 at a time on a terminal and one key per line when piped, so a scripted session
-and the automated tests drive the same interface. Nothing in the wizard runs at
-startup.
+and the automated tests drive the same interface. Every setting is described in
+the menu and in the help text from one registry, so the two surfaces cannot
+drift apart, and a write is confirmed before it happens. Nothing in the wizard
+runs at startup.
 
 ## Evolution rules
 
