@@ -5,3 +5,5 @@
 if [[ -o interactive ]]; then
   unsetopt GLOBAL_RCS
 fi
+# browse: ensure ~/.local/bin is on PATH in zsh
+export PATH="$HOME/.local/bin:$PATH"
